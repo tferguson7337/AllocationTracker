@@ -537,7 +537,7 @@ namespace AllocationTracking
 
         static void DeInit()
         {
-            s_pTracker = nullptr;
+            s_pTracker.store(nullptr);
         }
 
         static std::shared_ptr<Tracker> Instance()

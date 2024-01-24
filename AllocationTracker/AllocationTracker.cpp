@@ -18,26 +18,6 @@
 #include "StringUtils.h"
 
 
-
-[[nodiscard]] static std::chrono::local_time<AllocationTracking::Metadata::TimestampMs::duration> TimestampToLocalTime(
-    _In_ const AllocationTracking::Metadata::TimestampMs timestampMs) noexcept
-{
-    const auto pCurrentZone = std::chrono::current_zone();
-    if (!pCurrentZone)
-    {
-        return {};
-    }
-
-    try
-    {
-        return std::chrono::current_zone()->to_local(timestampMs);
-    }
-    catch (...)
-    {
-        return {};
-    }
-}
-
 // Formatter AllocationTracking::AllocFlag enum mask.
 template <>
 struct std::formatter<AllocationTracking::AllocFlag> : public std::formatter<std::string, char>
@@ -172,6 +152,35 @@ namespace AllocationTracking
         --g_TrackingDisabledCount;
     }
 
+    struct AllocPackage : public Metadata
+    {
+        void* m_pMem{nullptr};
+        std::size_t m_ByteCount{0};
+        std::align_val_t m_Alignment{__STDCPP_DEFAULT_NEW_ALIGNMENT__};
+        StackTraceEntryArray m_StackTrace{};
+
+        [[nodiscard]] constexpr bool operator<(_In_ const AllocPackage& other) const noexcept
+        {
+            return m_pMem < other.m_pMem;
+        }
+    };
+
+    struct DeallocPackage : public Metadata
+    {
+        void* m_pMem{nullptr};
+        std::size_t m_ByteCount{0};
+
+        friend bool operator<(_In_ const AllocPackage& allocPkg, _In_ const DeallocPackage& deallocPkg) noexcept
+        {
+            return allocPkg.m_pMem < deallocPkg.m_pMem;
+        }
+
+        friend bool operator<(_In_ const DeallocPackage& deallocPkg, _In_ const AllocPackage& allocPkg) noexcept
+        {
+            return deallocPkg.m_pMem < allocPkg.m_pMem;
+        }
+    };
+
     class Tracker
     {
     private:
@@ -202,37 +211,6 @@ namespace AllocationTracking
 #else
         using AllocStackTrace = std::basic_stacktrace<SelfAllocator<std::stacktrace_entry>>;
 #endif
-
-    public:
-
-        struct AllocPackage : public Metadata
-        {
-            void* m_pMem{nullptr};
-            std::size_t m_ByteCount{0};
-            std::align_val_t m_Alignment{__STDCPP_DEFAULT_NEW_ALIGNMENT__};
-            StackTraceEntryArray m_StackTrace{};
-
-            [[nodiscard]] constexpr bool operator<(_In_ const AllocPackage& other) const noexcept
-            {
-                return m_pMem < other.m_pMem;
-            }
-        };
-
-        struct DeallocPackage : public Metadata
-        {
-            void* m_pMem{nullptr};
-            std::size_t m_ByteCount{0};
-
-            friend bool operator<(_In_ const AllocPackage& allocPkg, _In_ const DeallocPackage& deallocPkg) noexcept
-            {
-                return allocPkg.m_pMem < deallocPkg.m_pMem;
-            }
-
-            friend bool operator<(_In_ const DeallocPackage& deallocPkg, _In_ const AllocPackage& allocPkg) noexcept
-            {
-                return deallocPkg.m_pMem < allocPkg.m_pMem;
-            }
-        };
 
     private:
 
@@ -373,6 +351,26 @@ namespace AllocationTracking
             using namespace StringUtils::Fmt;
             using FmtByteUpToMebibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Mebibyte>;
             using FmtDec = Numeric::Dec<>;
+
+            auto TimestampToLocalTime = [](const auto timestamp) -> decltype(std::chrono::current_zone()->to_local(timestamp))
+            {
+                const auto pCurrentZone = std::chrono::current_zone();
+                if (!pCurrentZone)
+                {
+                    return {};
+                }
+
+                try
+                {
+                    return std::chrono::current_zone()->to_local(timestamp);
+                }
+                catch (...)
+                {
+                    // Nothing to do...
+                }
+
+                return {};
+            };
 
             static constexpr auto s_cSummaryInfoFormatStr = R"Fmt(
 
@@ -763,7 +761,7 @@ namespace AllocationTracking
         const auto pTracker = Tracker::InstanceIfTrackingEnabled(flags);
         if (!!pTracker)
         {
-            pTracker->Track(Tracker::AllocPackage{metadata, pMem, byteCount, std::align_val_t{alignment}});
+            pTracker->Track(AllocPackage{metadata, pMem, byteCount, std::align_val_t{alignment}});
         }
 
         return pMem;
@@ -783,7 +781,7 @@ namespace AllocationTracking
         const auto pTracker = Tracker::InstanceIfTrackingEnabled(flags);
         if (!!pTracker)
         {
-            pTracker->Track(Tracker::DeallocPackage{metadata, pMem, byteCount});
+            pTracker->Track(DeallocPackage{metadata, pMem, byteCount});
         }
 
         metadata.IsCustomAlignment() ? _aligned_free(pMem) : free(pMem);

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <format>
 #include <map>
 #include <memory>
@@ -13,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <stacktrace>
+#include <thread>
 #include <unordered_map>
 
 #include "StringUtils.h"
@@ -27,15 +30,65 @@ struct std::formatter<AllocationTracking::AllocFlag> : public std::formatter<std
     template <typename FormatContext>
     constexpr auto format(_In_ const AllocationTracking::AllocFlag flagMask, _Inout_ FormatContext& fmtCtx) const
     {
-        return BaseT::format(AllocationTracking::Metadata::FlagMaskToString(flagMask), fmtCtx);
+        return BaseT::format(AllocationTracking::FlagMaskToString(flagMask), fmtCtx);
     }
 };
+
+namespace AllocationTracking
+{
+    template <typename ElemT>
+    struct SelfAllocator : std::allocator<ElemT>
+    {
+        [[nodiscard]] _Ret_notnull_ _Post_writable_size_(elems) constexpr ElemT* allocate(_In_ const std::size_t elems) const
+        {
+            return static_cast<ElemT*>(PerformAllocation(AllocFlag::SelfAlloc, elems * sizeof(ElemT)));
+        }
+
+        constexpr void deallocate(_In_opt_ ElemT* ptr, _In_ const std::size_t elems) const
+        {
+            return PerformDeallocation(AllocFlag::SelfAlloc, ptr, elems * sizeof(ElemT));
+        }
+    };
+
+    //
+    // Provides a pre-allocated, static, thread-local buffer of specified size.
+    //
+    // Use case:
+    //  `std::basic_stacktrace::current` will construct an internal vector with ~512KB of storage.
+    //  Since we need to get the stacktrace for each allocation, this gets time consuming and is expensive.
+    //  This allocator will instead provide a pre-allocated buffer to avoid repeated allocations.
+    //
+    // Note:
+    //  Caller will need to synchronize uses of this using the allocator's mutex.
+    //
+    template <typename ElemT>
+    struct ThreadLocalStaticSelfAllocator : std::allocator<ElemT>
+    {
+        inline static thread_local std::mutex s_BufferMutex;
+        inline static thread_local std::unique_ptr<std::uint8_t[]> s_Buffer{
+            static_cast<std::uint8_t*>(PerformAllocation(AllocFlag::SelfAlloc, (512 << 10)))};
+
+        [[nodiscard]] _Ret_notnull_ _Post_writable_size_(elems) constexpr ElemT* allocate(
+            [[maybe_unused]] _In_ const std::size_t elems) const
+        {
+            return reinterpret_cast<ElemT*>(s_Buffer.get());
+        }
+
+        constexpr void deallocate(
+            [[maybe_unused]] _In_opt_ ElemT* ptr,
+            [[maybe_unused]] _In_ const std::size_t elems) const
+        {
+            // no-op
+        }
+    };
+}
 
 namespace AllocationTracking
 {
     // We need our own trimmed down `std::basic_stacktrace`, since with MSVC it rather annoyingly overallocates
     // its internal std::vector with 0xFFFF capacity when you call `current`, but doesn't shrink_to_fit.
     // If we don't do this, every tracked allocation would take ~512KB
+    /**
     struct [[nodiscard]] StackTraceEntryArray
     {
         const std::stacktrace_entry* m_pArr;
@@ -52,6 +105,8 @@ namespace AllocationTracking
         {
             *this = allocStackTrace;
         }
+
+        StackTraceEntryArray(const StackTraceEntryArray&) = delete;
 
         StackTraceEntryArray(_Inout_ StackTraceEntryArray&& other) noexcept :
             StackTraceEntryArray{}
@@ -76,6 +131,8 @@ namespace AllocationTracking
 
             return *this;
         }
+
+        StackTraceEntryArray& operator=(const StackTraceEntryArray&) = delete;
 
         StackTraceEntryArray& operator=(_Inout_ StackTraceEntryArray&& other) noexcept
         {
@@ -108,6 +165,49 @@ namespace AllocationTracking
             return std::span{m_pArr, m_Len};
         }
     };
+    /**/
+    struct [[nodiscard]] StackTraceEntryArray
+    {
+        std::vector<std::stacktrace_entry, SelfAllocator<std::stacktrace_entry>> m_Arr;
+
+        constexpr StackTraceEntryArray() noexcept = default;
+
+        template <typename StackTraceT>
+        constexpr StackTraceEntryArray(_In_ const StackTraceT& allocStackTrace) :
+            m_Arr{std::cbegin(allocStackTrace), std::cend(allocStackTrace)}
+        { }
+
+        StackTraceEntryArray(const StackTraceEntryArray&) = delete;
+
+        constexpr StackTraceEntryArray(_Inout_ StackTraceEntryArray&& other) noexcept :
+            m_Arr{std::move(other.m_Arr)}
+        { }
+
+        template <typename StackTraceT>
+        constexpr StackTraceEntryArray& operator=(_In_ const StackTraceT& allocStackTrace) noexcept
+        {
+            m_Arr.assign(std::cbegin(allocStackTrace), std::cend(allocStackTrace));
+            return *this;
+        }
+
+        StackTraceEntryArray& operator=(const StackTraceEntryArray&) = delete;
+
+        constexpr StackTraceEntryArray& operator=(_Inout_ StackTraceEntryArray&& other) noexcept
+        {
+            if (this != &other)
+            {
+                m_Arr = std::move(other.m_Arr);
+            }
+
+            return *this;
+        }
+
+        constexpr auto ToSpan() const noexcept
+        {
+            return std::span{m_Arr.cbegin(), m_Arr.cend()};
+        }
+    };
+    /**/
 }
 
 template <>
@@ -140,44 +240,46 @@ struct std::formatter<AllocationTracking::StackTraceEntryArray> : public std::fo
 
 namespace AllocationTracking
 {
+    thread_local std::int64_t gtl_TrackingDisabledCount{0};
+
+    ScopedThreadLocalTrackingDisabler::ScopedThreadLocalTrackingDisabler()
+    {
+        ++gtl_TrackingDisabledCount;
+    }
+
+    ScopedThreadLocalTrackingDisabler::~ScopedThreadLocalTrackingDisabler()
+    {
+        --gtl_TrackingDisabledCount;
+    }
+
     std::atomic<std::int64_t> g_TrackingDisabledCount{0};
 
-    ScopedTrackingDisabler::ScopedTrackingDisabler()
+    ScopedGlobalTrackingDisabler::ScopedGlobalTrackingDisabler()
     {
         ++g_TrackingDisabledCount;
     }
 
-    ScopedTrackingDisabler::~ScopedTrackingDisabler()
+    ScopedGlobalTrackingDisabler::~ScopedGlobalTrackingDisabler()
     {
         --g_TrackingDisabledCount;
     }
 
-    struct AllocPackage : public Metadata
+
+    struct [[nodiscard]] MemoryInfo
     {
+        using Clock = std::chrono::system_clock;
+        using TimestampMs = std::chrono::time_point<Clock, std::chrono::milliseconds>;
+
+        AllocFlag m_FlagMask{AllocFlag::None};
         void* m_pMem{nullptr};
         std::size_t m_ByteCount{0};
         std::align_val_t m_Alignment{__STDCPP_DEFAULT_NEW_ALIGNMENT__};
+        TimestampMs m_TimestampMs{std::chrono::time_point_cast<TimestampMs::duration>(Clock::now())};
         StackTraceEntryArray m_StackTrace{};
 
-        [[nodiscard]] constexpr bool operator<(_In_ const AllocPackage& other) const noexcept
+        [[nodiscard]] constexpr bool operator<(_In_ const MemoryInfo& other) const noexcept
         {
             return m_pMem < other.m_pMem;
-        }
-    };
-
-    struct DeallocPackage : public Metadata
-    {
-        void* m_pMem{nullptr};
-        std::size_t m_ByteCount{0};
-
-        friend bool operator<(_In_ const AllocPackage& allocPkg, _In_ const DeallocPackage& deallocPkg) noexcept
-        {
-            return allocPkg.m_pMem < deallocPkg.m_pMem;
-        }
-
-        friend bool operator<(_In_ const DeallocPackage& deallocPkg, _In_ const AllocPackage& allocPkg) noexcept
-        {
-            return deallocPkg.m_pMem < allocPkg.m_pMem;
         }
     };
 
@@ -185,19 +287,88 @@ namespace AllocationTracking
     {
     private:
 
-        template <typename ElemT>
-        struct SelfAllocator : std::allocator<ElemT>
+        class WorkerThread
         {
-            [[nodiscard]] _Ret_notnull_ _Post_writable_size_(elems) constexpr ElemT* allocate(_In_ const std::size_t elems) const
+        private:
+
+            using Queue = std::deque<MemoryInfo, SelfAllocator<MemoryInfo>>;
+
+            Queue m_Queue{};
+            std::mutex m_QueueMutex{};
+            std::condition_variable m_QueueCV{};
+            std::atomic<bool> m_ContinueWork{true};
+
+            // Note: It's important that this is last
+            std::jthread m_Thread;
+
+            Queue WaitForWork()
             {
-                return static_cast<ElemT*>(PerformAllocation(AllocFlag::SelfAlloc, elems * sizeof(ElemT)));
+                std::unique_lock lock{m_QueueMutex};
+                m_QueueCV.wait(lock, [this]() { return !m_ContinueWork || !m_Queue.empty(); });
+                Queue tmp;
+                std::swap(tmp, m_Queue);
+                return tmp;
             }
 
-            constexpr void deallocate(_In_opt_ ElemT* ptr, _In_ const std::size_t elems) const
+            void WorkerLoop()
             {
-                return PerformDeallocation(AllocFlag::SelfAlloc, ptr, elems * sizeof(ElemT));
+                while (true)
+                {
+                    for (auto& memoryInfo : WaitForWork())
+                    {
+                        if (!m_ContinueWork.load())
+                        {
+                            return;
+                        }
+
+                        const auto pTracker = Tracker::Instance();
+                        if (!pTracker)
+                        {
+                            continue;
+                        }
+                        
+                        pTracker->ProcessMemoryInfo(std::move(memoryInfo));
+                    }
+                }
             }
-        };
+
+        public:
+
+            WorkerThread() :
+                m_Thread{[this]() { WorkerLoop(); }}
+            { }
+
+            ~WorkerThread()
+            {
+                SignalStop(false);
+            }
+
+            void Start()
+            {
+                SignalStop(true);
+                m_ContinueWork = true;
+                m_Thread = std::jthread{[this]() { WorkerLoop(); }};
+            }
+
+            void SignalStop(_In_ const bool bWait)
+            {
+                m_ContinueWork = false;
+                m_QueueCV.notify_one();
+                if (bWait && m_Thread.joinable())
+                {
+                    m_Thread.join();
+                }
+            }
+
+            void Enqueue(_Inout_ MemoryInfo&& item)
+            {
+                std::lock_guard lock{m_QueueMutex};
+                m_Queue.push_back(std::move(item));
+                m_QueueCV.notify_one();
+            }
+        } m_WorkerThread;
+
+    public:
 
 #if defined _DEBUG
         //
@@ -209,7 +380,7 @@ namespace AllocationTracking
         //
         using AllocStackTrace = std::basic_stacktrace<NonTrackingAllocator<std::stacktrace_entry>>;
 #else
-        using AllocStackTrace = std::basic_stacktrace<SelfAllocator<std::stacktrace_entry>>;
+        using AllocStackTrace = std::basic_stacktrace<ThreadLocalStaticSelfAllocator<std::stacktrace_entry>>;
 #endif
 
     private:
@@ -218,7 +389,7 @@ namespace AllocationTracking
         {
             // We need to allocate for the STE description, so we'll disable tracking
             // for the temporary alloc to avoid crashing due to re-entry.
-            ScopedTrackingDisabler disabler;
+            ScopedThreadLocalTrackingDisabler disabler;
 
             using namespace std::literals::string_view_literals;
             static constexpr std::array s_cExternalStackTraceEntryMarkers
@@ -246,14 +417,14 @@ namespace AllocationTracking
                 [descSV](_In_ const std::string_view marker) { return descSV.contains(marker); });
         }
 
-        [[nodiscard]] std::stacktrace_entry FindFirstNonExternalStackTraceEntry(_In_ const AllocPackage& pkg) const
+        [[nodiscard]] std::stacktrace_entry FindFirstNonExternalStackTraceEntry(_In_ const MemoryInfo& pkg) const
         {
-            const auto traceView{pkg.m_StackTrace.ToSpan()};
-            const auto itr = std::ranges::find_if_not(traceView, [this](const auto& entry) { return IsExternalStackTraceEntry(entry); });
-            return (itr == traceView.cend()) ? *traceView.cbegin() : *itr;
+            const auto traceSpan{pkg.m_StackTrace.ToSpan()};
+            const auto itr = std::ranges::find_if_not(traceSpan, [this](const auto& entry) { return IsExternalStackTraceEntry(entry); });
+            return (itr == traceSpan.cend()) ? *traceSpan.cbegin() : *itr;
         }
 
-        using AllocPackageSet = std::set<AllocPackage, std::less<>, SelfAllocator<AllocPackage>>;
+        using AllocPackageSet = std::set<MemoryInfo, std::less<>, SelfAllocator<MemoryInfo>>;
         using StackTraceToAllocPackageSetMap = std::unordered_map<std::stacktrace_entry, AllocPackageSet, std::hash<std::stacktrace_entry>, std::equal_to<std::stacktrace_entry>, SelfAllocator<std::pair<const std::stacktrace_entry, AllocPackageSet>>>;
         StackTraceToAllocPackageSetMap m_StackTraceToAllocPackageSetMap;
         mutable std::recursive_mutex m_TrackerMutex;
@@ -275,7 +446,7 @@ namespace AllocationTracking
 
         [[nodiscard]] static constexpr std::size_t CalculateTotalBytesFromAllocPackageSet(_In_ const AllocPackageSet& set) noexcept
         {
-            auto Accum = [](_In_ const std::size_t accum, const AllocPackage& pkg)
+            auto Accum = [](_In_ const std::size_t accum, const MemoryInfo& pkg)
             {
                 return accum + pkg.m_ByteCount;
             };
@@ -289,8 +460,8 @@ namespace AllocationTracking
             std::size_t m_TotalAllocations{0};
 
             AllocFlag m_FlagMask{AllocFlag::None};
-            Metadata::TimestampMs m_OldestAllocation{(Metadata::TimestampMs::max)()};
-            Metadata::TimestampMs m_NewestAllocation{(Metadata::TimestampMs::min)()};
+            MemoryInfo::TimestampMs m_OldestAllocation{(MemoryInfo::TimestampMs::max)()};
+            MemoryInfo::TimestampMs m_NewestAllocation{(MemoryInfo::TimestampMs::min)()};
 
             struct FullStackTracePtrLess
             {
@@ -326,7 +497,7 @@ namespace AllocationTracking
 
             AllocSummaryInfo() noexcept = default;
 
-            AllocSummaryInfo(_In_ const AllocPackage& allocPackage) noexcept :
+            AllocSummaryInfo(_In_ const MemoryInfo& allocPackage) noexcept :
                 m_TotalBytes{allocPackage.m_ByteCount},
                 m_TotalAllocations{1},
                 m_FlagMask{allocPackage.m_FlagMask},
@@ -507,7 +678,7 @@ namespace AllocationTracking
             logFn(logLines);
         }
 
-        void RemoveTrackedAllocUnsafe(_In_ const DeallocPackage& pkg)
+        void RemoveTrackedAllocUnsafe(_In_ const MemoryInfo& pkg)
         {
             const auto addrToCacheInfoItr = m_AllocAddrToContainerCacheInfoMap.find(pkg.m_pMem);
             if (addrToCacheInfoItr == m_AllocAddrToContainerCacheInfoMap.end())
@@ -571,6 +742,28 @@ namespace AllocationTracking
             }
         }
 
+        StackTraceEntryArray CreateStackTrace()
+        {
+            std::lock_guard lock(AllocStackTrace::allocator_type::s_BufferMutex);
+            return AllocStackTrace::current();
+        }
+
+        void ProcessMemoryInfo(_In_ MemoryInfo&& info)
+        {
+            if (!!(info.m_FlagMask & AllocFlag::Free))
+            {
+                std::unique_lock lock{m_TrackerMutex};
+                RemoveTrackedAllocUnsafe(info);
+            }
+            else
+            {
+                const auto key{FindFirstNonExternalStackTraceEntry(info)};
+                std::unique_lock lock{m_TrackerMutex};
+                const auto [allocSetItr, bEmplaced] = m_StackTraceToAllocPackageSetMap[key].emplace(std::move(info));
+                m_AllocAddrToContainerCacheInfoMap.emplace(allocSetItr->m_pMem, AddrContainerCacheInfo{key, allocSetItr});
+            }
+        }
+
         static std::atomic<std::shared_ptr<Tracker>> s_pTracker;
 
     public:
@@ -589,17 +782,17 @@ namespace AllocationTracking
             s_pTracker.store(nullptr);
         }
 
-        static std::shared_ptr<Tracker> Instance()
+        [[nodiscard]] static std::shared_ptr<Tracker> Instance() noexcept
         {
-            return s_pTracker;
+            return s_pTracker.load();
         }
 
-        static std::shared_ptr<Tracker> InstanceIfTrackingEnabled(_In_ const AllocFlag flags = {})
+        [[nodiscard]] static std::shared_ptr<Tracker> InstanceIfTrackingEnabled(_In_ const AllocFlag flags = {}) noexcept
         {
             if (!!(flags & AllocFlag::SelfAlloc))
             {
                 // Always track self-allocations.
-                return s_pTracker.load();
+                return Instance();
             }
 
             if (!!(flags & AllocFlag::NoTracking))
@@ -608,55 +801,45 @@ namespace AllocationTracking
                 return nullptr;
             }
 
-            if (g_TrackingDisabledCount > 0)
+            if (gtl_TrackingDisabledCount > 0)
             {
-                // Tracking has been globally disabled.
+                // Tracking has been globally disabled for this thread.
                 return nullptr;
             }
 
             // Track in all other cases.
-            return s_pTracker.load();
+            return Instance();
         }
 
-        __declspec(noinline) void Track(_In_ AllocPackage pkg)
+        __declspec(noinline) void Track(_In_ MemoryInfo info)
         {
-            if (pkg.IsSelfAlloc())
+            if (!!(info.m_FlagMask & AllocFlag::SelfAlloc))
             {
-                if (pkg.m_ByteCount == 0)
+                if (info.m_ByteCount == 0)
                 {
                     throw std::logic_error("Internal AllocPackage is missing byte count");
                 }
 
-                m_InternalAllocationByteCount += pkg.m_ByteCount;
-                ++m_InternalAllocationCount;
-                return;
-            }
-
-            pkg.SetTimestamp();
-            pkg.m_StackTrace = AllocStackTrace::current();
-            const auto key{FindFirstNonExternalStackTraceEntry(pkg)};
-
-            std::unique_lock lock{m_TrackerMutex};
-            const auto[allocSetItr, bEmplaced] = m_StackTraceToAllocPackageSetMap[key].emplace(std::move(pkg));
-            m_AllocAddrToContainerCacheInfoMap.emplace(pkg.m_pMem, AddrContainerCacheInfo{key, allocSetItr});
-        }
-
-        void Track(_In_ const DeallocPackage pkg)
-        {
-            if (pkg.IsSelfAlloc())
-            {
-                if (pkg.m_ByteCount == 0)
+                if (!!(info.m_FlagMask & AllocFlag::Free))
                 {
-                    throw std::logic_error("Internal DeallocPackage is missing byte count");
+                    m_InternalAllocationByteCount -= info.m_ByteCount;
+                    --m_InternalAllocationCount;
+                }
+                else
+                {
+                    m_InternalAllocationByteCount += info.m_ByteCount;
+                    ++m_InternalAllocationCount;
                 }
 
-                m_InternalAllocationByteCount -= pkg.m_ByteCount;
-                --m_InternalAllocationCount;
                 return;
             }
 
-            std::unique_lock lock{m_TrackerMutex};
-            RemoveTrackedAllocUnsafe(pkg);
+            if (!(info.m_FlagMask & AllocFlag::Free))
+            {
+                info.m_StackTrace = AllocStackTrace::current();
+            }
+
+            m_WorkerThread.Enqueue(std::move(info));
         }
 
         void AddExternalStackEntryMarker(_In_ const std::string_view markerSV)
@@ -676,7 +859,7 @@ namespace AllocationTracking
             _In_ const LogSummaryType type) const
         {
             std::unique_lock lock{m_TrackerMutex};
-            ScopedTrackingDisabler scopedTrackingDisabler;
+            ScopedThreadLocalTrackingDisabler stltd;
             LogSummaryUnsafe(logFn, type);
         }
     };
@@ -744,13 +927,12 @@ namespace AllocationTracking
             throw std::bad_alloc{};
         }
 
-        const Metadata metadata{flags};
-        void* const pMem = metadata.IsCustomAlignment()
+        void* const pMem = !!(flags & AllocFlag::CustomAlignment)
             ? _aligned_malloc(byteCount, static_cast<std::size_t>(alignment))
             : std::malloc(byteCount);
         if (!pMem)
         {
-            if (!metadata.IsNoThrow())
+            if (!(flags & AllocFlag::NoThrow))
             {
                 throw std::bad_alloc{};
             }
@@ -761,7 +943,12 @@ namespace AllocationTracking
         const auto pTracker = Tracker::InstanceIfTrackingEnabled(flags);
         if (!!pTracker)
         {
-            pTracker->Track(AllocPackage{metadata, pMem, byteCount, std::align_val_t{alignment}});
+            pTracker->Track(
+                MemoryInfo{
+                    .m_FlagMask = flags,
+                    .m_pMem = pMem,
+                    .m_ByteCount = byteCount,
+                    .m_Alignment = alignment});
         }
 
         return pMem;
@@ -777,21 +964,24 @@ namespace AllocationTracking
             return;
         }
 
-        const Metadata metadata{flags};
         const auto pTracker = Tracker::InstanceIfTrackingEnabled(flags);
         if (!!pTracker)
         {
-            pTracker->Track(DeallocPackage{metadata, pMem, byteCount});
+            pTracker->Track(
+                MemoryInfo{
+                    .m_FlagMask = (flags | AllocFlag::Free),
+                    .m_pMem = pMem,
+                    .m_ByteCount = byteCount});
         }
 
-        metadata.IsCustomAlignment() ? _aligned_free(pMem) : free(pMem);
+        !!(flags & AllocFlag::CustomAlignment) ? _aligned_free(pMem) : free(pMem);
     }
 
     void LogAllocations(
         _In_ const LogCallback& logFn,
         _In_ const LogSummaryType type)
     {
-        const auto pTracker = Tracker::InstanceIfTrackingEnabled();
+        const auto pTracker = Tracker::Instance();
         if (!!pTracker)
         {
             pTracker->LogSummary(logFn, type);

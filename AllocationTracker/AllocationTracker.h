@@ -20,6 +20,7 @@ namespace AllocationTracking
         CustomAlignment = 0x08,
         NoTracking = 0x10,
         SelfAlloc = 0x20,
+        Free = 0x40,
 
         _LastPlusOne,
         _Begin = 0x1,
@@ -85,96 +86,49 @@ namespace AllocationTracking
         return static_cast<UT>(rhs) == 0;
     }
 
-    struct [[nodiscard]] Metadata
+    [[nodiscard]] constexpr std::string_view FlagToStringView(_In_ const AllocFlag flag) noexcept
     {
-        using Clock = std::chrono::system_clock;
-        using TimestampMs = std::chrono::time_point<Clock, std::chrono::milliseconds>;
-
-        AllocFlag m_FlagMask{AllocFlag::None};
-        TimestampMs m_TimestampMs{};
-
-        constexpr Metadata(_In_ const AllocFlag mask = AllocFlag::None) :
-            m_FlagMask{mask}
-        { }
-
-        void SetTimestamp()
+        using namespace std::string_view_literals;
+        switch (flag)
         {
-            m_TimestampMs = std::chrono::time_point_cast<TimestampMs::duration>(Clock::now());
+        case AllocFlag::None: return "None"sv;
+        case AllocFlag::Array: return "Array"sv;
+        case AllocFlag::NoThrow: return "NoThrow"sv;
+        case AllocFlag::Placement: return "Placement"sv;
+        case AllocFlag::CustomAlignment: return "CustomAlignment"sv;
+        case AllocFlag::NoTracking: return "NoTracking"sv;
+        case AllocFlag::SelfAlloc: return "SelfAlloc"sv;
+        case AllocFlag::Free: return "Free"sv;
         }
 
-        [[nodiscard]] constexpr bool IsArray() const noexcept
+        return "Unknown"sv;
+    }
+
+    [[nodiscard]] _CONSTEXPR20 std::string FlagMaskToString(_In_ const AllocFlag mask)
+    {
+        if (!mask)
         {
-            return !!(m_FlagMask & AllocFlag::Array);
+            using namespace std::string_literals;
+            return "None"s;
         }
 
-        [[nodiscard]] constexpr bool IsNoThrow() const noexcept
-        {
-            return !!(m_FlagMask & AllocFlag::NoThrow);
-        }
+        std::string str;
+        str.reserve(64);
 
-        [[nodiscard]] constexpr bool IsPlacement() const noexcept
+        for (AllocFlag bit = AllocFlag::_Begin; bit != AllocFlag::_End; bit <<= 1)
         {
-            return !!(m_FlagMask & AllocFlag::Placement);
-        }
+            if (!(bit & mask))
+            {
+                continue;
+            }
 
-        [[nodiscard]] constexpr bool IsCustomAlignment() const noexcept
-        {
-            return !!(m_FlagMask & AllocFlag::CustomAlignment);
-        }
-
-        [[nodiscard]] constexpr bool IsNoTracking() const noexcept
-        {
-            return !!(m_FlagMask & AllocFlag::NoTracking);
-        }
-
-        [[nodiscard]] constexpr bool IsSelfAlloc() const noexcept
-        {
-            return !!(m_FlagMask & AllocFlag::SelfAlloc);
-        }
-
-        [[nodiscard]] static constexpr std::string_view FlagToStringView(_In_ const AllocFlag flag) noexcept
-        {
             using namespace std::string_view_literals;
-            switch (flag)
-            {
-            case AllocFlag::None: return "None"sv;
-            case AllocFlag::Array: return "Array"sv;
-            case AllocFlag::NoThrow: return "NoThrow"sv;
-            case AllocFlag::Placement: return "Placement"sv;
-            case AllocFlag::CustomAlignment: return "CustomAlignment"sv;
-            case AllocFlag::NoTracking: return "NoTracking"sv;
-            case AllocFlag::SelfAlloc: return "SelfAlloc"sv;
-            }
-
-            return "Unknown"sv;
+            if (!str.empty()) { str += ", "sv; }
+            str += FlagToStringView(bit);
         }
 
-        [[nodiscard]] static std::string FlagMaskToString(_In_ const AllocFlag mask)
-        {
-            if (!mask)
-            {
-                using namespace std::string_literals;
-                return "None"s;
-            }
-
-            std::string str;
-            str.reserve(64);
-
-            for (AllocFlag bit = AllocFlag::_Begin; bit != AllocFlag::_End; bit <<= 1)
-            {
-                if (!(bit & mask))
-                {
-                    continue;
-                }
-
-                using namespace std::string_view_literals;
-                if (!str.empty()) { str += ", "sv; }
-                str += FlagToStringView(bit);
-            }
-
-            return str;
-        }
-    };
+        return str;
+    }
 }
 
 
@@ -207,10 +161,16 @@ namespace AllocationTracking
 
 namespace AllocationTracking
 {
-    struct ScopedTrackingDisabler
+    struct ScopedThreadLocalTrackingDisabler
     {
-        ScopedTrackingDisabler();
-        ~ScopedTrackingDisabler();
+        ScopedThreadLocalTrackingDisabler();
+        ~ScopedThreadLocalTrackingDisabler();
+    };
+
+    struct ScopedGlobalTrackingDisabler
+    {
+        ScopedGlobalTrackingDisabler();
+        ~ScopedGlobalTrackingDisabler();
     };
 
     struct ScopedTrackerInit

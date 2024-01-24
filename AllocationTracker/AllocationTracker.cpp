@@ -289,6 +289,8 @@ namespace AllocationTracking
 
         class WorkerThread
         {
+            friend class Tracker;
+
         private:
 
             using Queue = std::deque<MemoryInfo, SelfAllocator<MemoryInfo>>;
@@ -296,7 +298,8 @@ namespace AllocationTracking
             Queue m_Queue{};
             std::mutex m_QueueMutex{};
             std::condition_variable m_QueueCV{};
-            std::atomic<bool> m_ContinueWork{true};
+            std::atomic<std::size_t> m_QueueLength{0};
+            std::atomic<bool> m_bContinueWork{true};
 
             // Note: It's important that this is last
             std::jthread m_Thread;
@@ -304,31 +307,61 @@ namespace AllocationTracking
             Queue WaitForWork()
             {
                 std::unique_lock lock{m_QueueMutex};
-                m_QueueCV.wait(lock, [this]() { return !m_ContinueWork || !m_Queue.empty(); });
+                m_QueueCV.wait_for(lock, std::chrono::seconds(1));
                 Queue tmp;
                 std::swap(tmp, m_Queue);
                 return tmp;
             }
 
+            void ProcessWorkItem(_Inout_ MemoryInfo&& info)
+            {
+                const auto pTracker = Tracker::Instance();
+                if (!!pTracker)
+                {
+                    pTracker->ProcessMemoryInfo(std::move(info));
+                    --m_QueueLength;
+                }
+            }
+
             void WorkerLoop()
             {
-                while (true)
+                while (m_bContinueWork.load())
                 {
-                    for (auto& memoryInfo : WaitForWork())
+                    auto work{WaitForWork()};
+                    for (auto& info : work)
                     {
-                        if (!m_ContinueWork.load())
+                        if (!m_bContinueWork.load())
                         {
                             return;
                         }
 
-                        const auto pTracker = Tracker::Instance();
-                        if (!pTracker)
-                        {
-                            continue;
-                        }
-                        
-                        pTracker->ProcessMemoryInfo(std::move(memoryInfo));
+                        ProcessWorkItem(std::move(info));
                     }
+                }
+            }
+
+            void EnqueueAndNotifyUnsafe(_Inout_ MemoryInfo&& item)
+            {
+                using Clock = std::chrono::steady_clock;
+                static constinit std::uint64_t s_BytesInFlightSinceLastNotify = 0;
+                static constinit std::uint64_t s_ItemsInFlightSinceLastNotify = 0;
+                static auto s_LastNotifyTime = Clock::now();
+
+                const auto now{Clock::now()};
+
+                s_BytesInFlightSinceLastNotify += item.m_ByteCount;
+                ++s_ItemsInFlightSinceLastNotify;
+                m_Queue.push_back(std::move(item));
+                ++m_QueueLength;
+
+                if ((s_BytesInFlightSinceLastNotify >= (1 << 20)) ||
+                    (s_ItemsInFlightSinceLastNotify > 1000) ||
+                    ((s_LastNotifyTime - now) > std::chrono::seconds(1)))
+                {
+                    s_BytesInFlightSinceLastNotify = 0;
+                    s_ItemsInFlightSinceLastNotify = 0;
+                    s_LastNotifyTime = now;
+                    m_QueueCV.notify_one();
                 }
             }
 
@@ -346,13 +379,13 @@ namespace AllocationTracking
             void Start()
             {
                 SignalStop(true);
-                m_ContinueWork = true;
+                m_bContinueWork = true;
                 m_Thread = std::jthread{[this]() { WorkerLoop(); }};
             }
 
             void SignalStop(_In_ const bool bWait)
             {
-                m_ContinueWork = false;
+                m_bContinueWork = false;
                 m_QueueCV.notify_one();
                 if (bWait && m_Thread.joinable())
                 {
@@ -363,8 +396,7 @@ namespace AllocationTracking
             void Enqueue(_Inout_ MemoryInfo&& item)
             {
                 std::lock_guard lock{m_QueueMutex};
-                m_Queue.push_back(std::move(item));
-                m_QueueCV.notify_one();
+                EnqueueAndNotifyUnsafe(std::move(item));
             }
         } m_WorkerThread;
 
@@ -669,9 +701,10 @@ namespace AllocationTracking
                 std::ranges::for_each(m_StackTraceToAllocPackageSetMap, CountMetrics);
             }
 
-            logLines += std::format("\n\n  Total Allocations[{} : {}]\n  Total Internal[{} : {}]",
+            logLines += std::format("\n\n  Total Allocations[{} : {}]\n  Total Internal[{} : {}]\n  Queue Length[{}]",
                 FmtDec{}(overallAllocSummaryInfo.m_TotalAllocations), FmtByteUpToMebibyte{}(overallAllocSummaryInfo.m_TotalBytes),
-                FmtDec{}(m_InternalAllocationCount.load()), FmtByteUpToMebibyte{}(m_InternalAllocationByteCount.load()));
+                FmtDec{}(m_InternalAllocationCount.load()), FmtByteUpToMebibyte{}(m_InternalAllocationByteCount.load()),
+                m_WorkerThread.m_QueueLength.load());
 
             logLines += "\n\n==================================================\n\n"sv;
 
@@ -803,7 +836,13 @@ namespace AllocationTracking
 
             if (gtl_TrackingDisabledCount > 0)
             {
-                // Tracking has been globally disabled for this thread.
+                // Tracking has been disabled for this thread.
+                return nullptr;
+            }
+
+            if (g_TrackingDisabledCount > 0)
+            {
+                // Tracking has been globally disabled for all threads.
                 return nullptr;
             }
 

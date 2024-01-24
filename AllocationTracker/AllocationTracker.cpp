@@ -223,9 +223,14 @@ namespace AllocationTracking
             void* m_pMem{nullptr};
             std::size_t m_ByteCount{0};
 
-            [[nodiscard]] operator AllocPackage() const noexcept
+            friend bool operator<(_In_ const AllocPackage& allocPkg, _In_ const DeallocPackage& deallocPkg) noexcept
             {
-                return AllocPackage{m_FlagMask, m_pMem, m_ByteCount, {}};
+                return allocPkg.m_pMem < deallocPkg.m_pMem;
+            }
+
+            friend bool operator<(_In_ const DeallocPackage& deallocPkg, _In_ const AllocPackage& allocPkg) noexcept
+            {
+                return deallocPkg.m_pMem < allocPkg.m_pMem;
             }
         };
 
@@ -274,6 +279,10 @@ namespace AllocationTracking
         using StackTraceToAllocPackageSetMap = std::unordered_map<std::stacktrace_entry, AllocPackageSet, std::hash<std::stacktrace_entry>, std::equal_to<std::stacktrace_entry>, SelfAllocator<std::pair<const std::stacktrace_entry, AllocPackageSet>>>;
         StackTraceToAllocPackageSetMap m_StackTraceToAllocPackageSetMap;
         mutable std::recursive_mutex m_TrackerMutex;
+
+        using AddrContainerCacheInfo = std::pair<std::stacktrace_entry, AllocPackageSet::const_iterator>;
+        using AllocationAddressToContainerCacheInfoMap = std::map<void*, AddrContainerCacheInfo, std::less<>, SelfAllocator<std::pair<void* const, AddrContainerCacheInfo>>>;
+        AllocationAddressToContainerCacheInfoMap m_AllocAddrToContainerCacheInfoMap;
 
         using ExternalUserStackTraceEntryMarkers = std::set<std::string_view, std::less<>, SelfAllocator<std::string_view>>;
         ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
@@ -498,26 +507,45 @@ namespace AllocationTracking
 
         void RemoveTrackedAllocUnsafe(_In_ const DeallocPackage& pkg)
         {
-            const auto mapEnd = m_StackTraceToAllocPackageSetMap.end();
-            for (auto mapItr = m_StackTraceToAllocPackageSetMap.begin(); mapItr != mapEnd; ++mapItr)
+            const auto addrToCacheInfoItr = m_AllocAddrToContainerCacheInfoMap.find(pkg.m_pMem);
+            if (addrToCacheInfoItr == m_AllocAddrToContainerCacheInfoMap.end())
             {
-                auto& allocPackageSet = mapItr->second;
-                const auto setItr = allocPackageSet.find(static_cast<AllocPackage>(pkg));
+                // We aren't tracking this memory.
+                return;
+            }
+
+            const auto [cachedSTEKey, cachedAllocPackageSetItr] = addrToCacheInfoItr->second;
+            m_AllocAddrToContainerCacheInfoMap.erase(addrToCacheInfoItr);
+
+            const auto steToAllocPkgSetItr = m_StackTraceToAllocPackageSetMap.find(cachedSTEKey);
+            if (steToAllocPkgSetItr != m_StackTraceToAllocPackageSetMap.end())
+            {
+                // Cache hit successful, remove corresponding entry in AllocPackageSet.
+                AllocPackageSet& allocPkgSet = steToAllocPkgSetItr->second;
+                allocPkgSet.erase(cachedAllocPackageSetItr);
+            }
+
+            //
+            // We have the address for the allocation cached, but couldn't find the AllocPackage via the cached STE.
+            //
+            // This is unexpected - fall back to linear search through the hash-map.
+            //
+            static bool bDebugBreakFlag = false;
+            if (!bDebugBreakFlag)
+            {
+                bDebugBreakFlag = true;
+                __debugbreak();
+            }
+
+            for (auto& [mapSTEKey, allocPackageSet] : m_StackTraceToAllocPackageSetMap)
+            {
+                const auto setItr = allocPackageSet.find(pkg);
                 if (setItr == allocPackageSet.end())
                 {
                     continue;
                 }
 
-                if (allocPackageSet.size() == 1)
-                {
-                    // Last alloc for this stack-trace, clear it from the map.
-                    m_StackTraceToAllocPackageSetMap.erase(mapItr);
-                }
-                else
-                {
-                    allocPackageSet.erase(setItr);
-                }
-
+                allocPackageSet.erase(setItr);
                 break;
             }
         }
@@ -566,22 +594,13 @@ namespace AllocationTracking
                 return;
             }
 
-            std::unique_lock lock{m_TrackerMutex};
             pkg.SetTimestamp();
-
             pkg.m_StackTrace = AllocStackTrace::current();
             const auto key{FindFirstNonExternalStackTraceEntry(pkg)};
-            const auto findItr = m_StackTraceToAllocPackageSetMap.find(key);
-            if (findItr == m_StackTraceToAllocPackageSetMap.end())
-            {
-                AllocPackageSet newSet;
-                newSet.insert(std::move(pkg));
-                m_StackTraceToAllocPackageSetMap.emplace(key, std::move(newSet));
-            }
-            else
-            {
-                findItr->second.insert(std::move(pkg));
-            }
+
+            std::unique_lock lock{m_TrackerMutex};
+            const auto[allocSetItr, bEmplaced] = m_StackTraceToAllocPackageSetMap[key].emplace(std::move(pkg));
+            m_AllocAddrToContainerCacheInfoMap.emplace(pkg.m_pMem, AddrContainerCacheInfo{key, allocSetItr});
         }
 
         void Track(_In_ const DeallocPackage pkg)

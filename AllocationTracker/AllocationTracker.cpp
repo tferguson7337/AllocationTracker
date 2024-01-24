@@ -701,7 +701,7 @@ namespace AllocationTracking
                 std::ranges::for_each(m_StackTraceToAllocPackageSetMap, CountMetrics);
             }
 
-            logLines += std::format("\n\n  Total Allocations[{} : {}]\n  Total Internal[{} : {}]\n  Queue Length[{}]",
+            logLines += std::format("\n\n  Total External[{} : {}]\n  Total Tracker[{} : {}]\n  Tracker Queue[{}]",
                 FmtDec{}(overallAllocSummaryInfo.m_TotalAllocations), FmtByteUpToMebibyte{}(overallAllocSummaryInfo.m_TotalBytes),
                 FmtDec{}(m_InternalAllocationCount.load()), FmtByteUpToMebibyte{}(m_InternalAllocationByteCount.load()),
                 m_WorkerThread.m_QueueLength.load());
@@ -915,7 +915,7 @@ namespace AllocationTracking
 
     void RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV)
     {
-        auto pTracker = Tracker::InstanceIfTrackingEnabled();
+        auto pTracker = Tracker::Instance();
         if (!!pTracker)
         {
             pTracker->AddExternalStackEntryMarker(markerSV);
@@ -924,7 +924,7 @@ namespace AllocationTracking
 
     void RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
     {
-        auto pTracker = Tracker::InstanceIfTrackingEnabled();
+        auto pTracker = Tracker::Instance();
         if (!!pTracker)
         {
             pTracker->AddExternalStackEntryMarkers(markers);

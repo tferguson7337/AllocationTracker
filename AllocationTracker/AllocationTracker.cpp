@@ -184,7 +184,7 @@ namespace AllocationTracking
                 return static_cast<ElemT*>(PerformAllocation(AllocFlag::SelfAlloc, elems * sizeof(ElemT)));
             }
 
-            constexpr void deallocate(_In_opt_ ElemT* ptr, _In_ [[maybe_unused]] const std::size_t elems) const
+            constexpr void deallocate(_In_opt_ ElemT* ptr, _In_ const std::size_t elems) const
             {
                 return PerformDeallocation(AllocFlag::SelfAlloc, ptr, elems * sizeof(ElemT));
             }
@@ -284,7 +284,7 @@ namespace AllocationTracking
         using AllocationAddressToContainerCacheInfoMap = std::map<void*, AddrContainerCacheInfo, std::less<>, SelfAllocator<std::pair<void* const, AddrContainerCacheInfo>>>;
         AllocationAddressToContainerCacheInfoMap m_AllocAddrToContainerCacheInfoMap;
 
-        using ExternalUserStackTraceEntryMarkers = std::set<std::string_view, std::less<>, SelfAllocator<std::string_view>>;
+        using ExternalUserStackTraceEntryMarkers = std::set<std::string, std::less<>, SelfAllocator<std::string>>;
         ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
 
         std::atomic<std::size_t> m_InternalAllocationByteCount{0};
@@ -292,7 +292,7 @@ namespace AllocationTracking
 
         void AddExternalStackEntryMarkerUnsafe(_In_ const std::string_view marker)
         {
-            m_ExternalUserStackTraceEntryMarkers.insert(marker);
+            m_ExternalUserStackTraceEntryMarkers.emplace(marker);
         }
 
         [[nodiscard]] static constexpr std::size_t CalculateTotalBytesFromAllocPackageSet(_In_ const AllocPackageSet& set) noexcept
@@ -371,7 +371,6 @@ namespace AllocationTracking
         [[nodiscard]] static std::string FormatAllocationSummaryInfo(_In_ const auto pairView)
         {
             using namespace StringUtils::Fmt;
-            using FmtByteUpToKibibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Kibibyte>;
             using FmtByteUpToMebibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Mebibyte>;
             using FmtDec = Numeric::Dec<>;
 
@@ -406,7 +405,6 @@ namespace AllocationTracking
             using namespace std::literals::string_view_literals;
 
             using namespace StringUtils::Fmt;
-            using FmtByteUpToKibibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Kibibyte>;
             using FmtByteUpToMebibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Mebibyte>;
             using FmtDec = Numeric::Dec<>;
 
@@ -428,7 +426,7 @@ namespace AllocationTracking
 
             if (type != LogSummaryType::Limited)
             {
-                using MapKey = AllocStackTrace::value_type;
+                using MapKey = std::stacktrace_entry;
                 using MapValue = AllocSummaryInfo;
                 using MapPair = std::pair<const MapKey, MapValue>;
                 using Map = std::map<MapKey, MapValue, std::less<MapKey>, NonTrackingAllocator<MapPair>>;
@@ -436,11 +434,17 @@ namespace AllocationTracking
 
                 auto CountMetricsAndBuildMap = [&CountMetrics, &steToTotalAllocMap, type, this](const auto& pair)
                 {
+                    const auto& [steKey, allocPackageSet] = pair;
+                    if (pair.second.empty())
+                    {
+                        return;
+                    }
+
                     auto& summaryInfo = steToTotalAllocMap[pair.first];
                     summaryInfo << CountMetrics(pair);
                     if (type == LogSummaryType::FullStackTraces)
                     {
-                        for (const auto& allocPkg : pair.second)
+                        for (const auto& allocPkg : allocPackageSet)
                         {
                             summaryInfo.m_FullStackTraces.insert(&allocPkg.m_StackTrace);
                         }
@@ -498,7 +502,7 @@ namespace AllocationTracking
 
             logLines += std::format("\n\n  Total Allocations[{} : {}]\n  Total Internal[{} : {}]",
                 FmtDec{}(overallAllocSummaryInfo.m_TotalAllocations), FmtByteUpToMebibyte{}(overallAllocSummaryInfo.m_TotalBytes),
-                FmtDec{}(m_InternalAllocationCount.load()), FmtByteUpToKibibyte{}(m_InternalAllocationByteCount.load()));
+                FmtDec{}(m_InternalAllocationCount.load()), FmtByteUpToMebibyte{}(m_InternalAllocationByteCount.load()));
 
             logLines += "\n\n==================================================\n\n"sv;
 
@@ -522,31 +526,50 @@ namespace AllocationTracking
             {
                 // Cache hit successful, remove corresponding entry in AllocPackageSet.
                 AllocPackageSet& allocPkgSet = steToAllocPkgSetItr->second;
-                allocPkgSet.erase(cachedAllocPackageSetItr);
-            }
-
-            //
-            // We have the address for the allocation cached, but couldn't find the AllocPackage via the cached STE.
-            //
-            // This is unexpected - fall back to linear search through the hash-map.
-            //
-            static bool bDebugBreakFlag = false;
-            if (!bDebugBreakFlag)
-            {
-                bDebugBreakFlag = true;
-                __debugbreak();
-            }
-
-            for (auto& [mapSTEKey, allocPackageSet] : m_StackTraceToAllocPackageSetMap)
-            {
-                const auto setItr = allocPackageSet.find(pkg);
-                if (setItr == allocPackageSet.end())
+                if (allocPkgSet.size() == 1)
                 {
-                    continue;
+                    // TODO?:
+                    //  Consider not erasing this hash-map entry to avoid needing to
+                    //  recreate it for hot code paths that have frequent short-lived allocs.
+                    m_StackTraceToAllocPackageSetMap.erase(steToAllocPkgSetItr);
+                }
+                else
+                {
+                    allocPkgSet.erase(cachedAllocPackageSetItr);
+                }
+            }
+            else
+            {
+                //
+                // We have the address for the allocation cached, but couldn't find the AllocPackage via the cached STE.
+                //
+                // This is unexpected - fall back to linear search through the hash-map.
+                //
+                static bool bDebugBreakFlag = false;
+                if (!bDebugBreakFlag)
+                {
+                    bDebugBreakFlag = true;
+                    __debugbreak();
                 }
 
-                allocPackageSet.erase(setItr);
-                break;
+                for (auto& [mapSTEKey, allocPackageSet] : m_StackTraceToAllocPackageSetMap)
+                {
+                    const auto setItr = allocPackageSet.find(pkg);
+                    if (setItr != allocPackageSet.end())
+                    {
+                        allocPackageSet.erase(setItr);
+                        return;
+                    }
+                }
+
+                //
+                // We failed to find this address at all, despite having it cached.
+                // Extremely unexpected.
+                //
+                const std::string exceptionMsg =
+                    std::format("Had cached address, but failed to find it in hash-map.\nAddr[{:p}]\nCached STE:\n{}",
+                        pkg.m_pMem, cachedSTEKey);
+                throw std::runtime_error(exceptionMsg);
             }
         }
 
@@ -575,9 +598,26 @@ namespace AllocationTracking
 
         static std::shared_ptr<Tracker> InstanceIfTrackingEnabled(_In_ const AllocFlag flags = {})
         {
-            return (!(flags & AllocFlag::NoTracking) && (g_TrackingDisabledCount == 0))
-                ? s_pTracker.load()
-                : nullptr;
+            if (!!(flags & AllocFlag::SelfAlloc))
+            {
+                // Always track self-allocations.
+                return s_pTracker.load();
+            }
+
+            if (!!(flags & AllocFlag::NoTracking))
+            {
+                // We're not tracking this allocation.
+                return nullptr;
+            }
+
+            if (g_TrackingDisabledCount > 0)
+            {
+                // Tracking has been globally disabled.
+                return nullptr;
+            }
+
+            // Track in all other cases.
+            return s_pTracker.load();
         }
 
         __declspec(noinline) void Track(_In_ AllocPackage pkg)
@@ -624,14 +664,12 @@ namespace AllocationTracking
         void AddExternalStackEntryMarker(_In_ const std::string_view markerSV)
         {
             std::unique_lock lock{m_TrackerMutex};
-            ScopedTrackingDisabler scopedTrackingDisabler;
             AddExternalStackEntryMarkerUnsafe(markerSV);
         }
 
         void AddExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
         {
             std::unique_lock lock{m_TrackerMutex};
-            ScopedTrackingDisabler scopedTrackingDisabler;
             std::ranges::for_each(markers, [this](const auto markerSV) { AddExternalStackEntryMarkerUnsafe(markerSV); });
         }
 

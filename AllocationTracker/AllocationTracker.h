@@ -11,7 +11,7 @@
 
 namespace AllocationTracking
 {
-    enum class AllocFlag : std::size_t
+    enum class AllocFlag : std::uint8_t
     {
         None = 0x00,
         Array = 0x01,
@@ -155,7 +155,8 @@ namespace AllocationTracking
 
     void LogAllocations(
         _In_ const LogCallback& logFn,
-        _In_ const LogSummaryType type);
+        _In_ const LogSummaryType type,
+        _In_ const bool bWaitForQueueEmpty = false);
 }
 
 
@@ -179,9 +180,10 @@ namespace AllocationTracking
         ~ScopedTrackerInit();
     };
 
-    // The allocator will typically story
     void RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV);
     void RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers);
+
+    void CollectFullStackTraces(_In_ const bool bCollect);
 }
 
 

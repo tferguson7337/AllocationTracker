@@ -401,6 +401,10 @@ namespace AllocationTracking
         using StackTraceEntryToMemoryInfoSetMap = std::unordered_map<std::stacktrace_entry, MemoryInfoSet, std::hash<std::stacktrace_entry>, std::equal_to<std::stacktrace_entry>, SelfAllocator<std::pair<const std::stacktrace_entry, MemoryInfoSet>>>;
         StackTraceEntryToMemoryInfoSetMap m_StackTraceEntryToMemoryInfoSetMap;
 
+        using CachedInfo = std::pair<std::stacktrace_entry, MemoryInfoSet::const_iterator>;
+        using AllocationAddrToCachedInfoMap = std::map<void*, CachedInfo, std::less<>, SelfAllocator<std::pair<void* const, CachedInfo>>>;
+        AllocationAddrToCachedInfoMap m_AllocationAddrToCachedInfoMap;
+
         using ExternalUserStackTraceEntryMarkers = std::vector<std::string, SelfAllocator<std::string>>;
         ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
 
@@ -729,37 +733,53 @@ namespace AllocationTracking
                 //  This would allow logarithmic/constant in `free` case, but require quite a bit extra memory overhead.
                 //  For std::map that's 48/56 bytes per allocation.
                 //
-
-                for (auto& [steKey, allocPackageSet] : m_StackTraceEntryToMemoryInfoSetMap)
+                const auto cachedInfoItr = m_AllocationAddrToCachedInfoMap.find(info.m_pMem);
+                if (cachedInfoItr != m_AllocationAddrToCachedInfoMap.end())
                 {
-                    if (allocPackageSet.empty())
+                    const auto [hashMapKey, infoSetItr] = cachedInfoItr->second;
+                    m_StackTraceEntryToMemoryInfoSetMap[hashMapKey].erase(infoSetItr);
+                    m_AllocationAddrToCachedInfoMap.erase(cachedInfoItr);
+                }
+                else
+                {
+                    // We didn't have the cached info.
+                    // Not expected - exhaustively search the hash map.
+                    __debugbreak();
+                    for (auto& [steKey, allocPackageSet] : m_StackTraceEntryToMemoryInfoSetMap)
                     {
-                        continue;
-                    }
+                        if (allocPackageSet.empty())
+                        {
+                            continue;
+                        }
 
-                    const auto setItr = allocPackageSet.find(info);
-                    if (setItr == allocPackageSet.end())
-                    {
-                        continue;
-                    }
+                        const auto setItr = allocPackageSet.find(info);
+                        if (setItr == allocPackageSet.end())
+                        {
+                            continue;
+                        }
 
-                    allocPackageSet.erase(setItr);
-                    return;
+                        allocPackageSet.erase(setItr);
+                        return;
+                    }
                 }
             }
             else
             {
-                const auto itr{FindSTEHashMapElement(info)};
-                if (itr != m_StackTraceEntryToMemoryInfoSetMap.end())
+                const auto hashMapItr{FindSTEHashMapElement(info)};
+                if (hashMapItr != m_StackTraceEntryToMemoryInfoSetMap.end())
                 {
                     if (!m_bCollectFullStackTraces) { info.m_StackTrace.Reset(); }
-                    itr->second.emplace(std::move(info));
+                    void* const ptr = info.m_pMem;
+                    const auto[infoSetItr, bEmplaceSuccess] = hashMapItr->second.emplace(std::move(info));
+                    m_AllocationAddrToCachedInfoMap.emplace(ptr, CachedInfo{hashMapItr->first, infoSetItr});
                 }
                 else
                 {
                     const auto key{FindFirstNonExternalStackTraceEntryByDescriptionUnsafe(info)};
                     if (!m_bCollectFullStackTraces) { info.m_StackTrace.Reset(); }
-                    m_StackTraceEntryToMemoryInfoSetMap[key].emplace(std::move(info));
+                    void* const ptr = info.m_pMem;
+                    const auto[infoSetItr, bEmplaceSuccess] = m_StackTraceEntryToMemoryInfoSetMap[key].emplace(std::move(info));
+                    m_AllocationAddrToCachedInfoMap.emplace(ptr, CachedInfo{key, infoSetItr});
                 }
             }
         }

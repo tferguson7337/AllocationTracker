@@ -55,16 +55,18 @@ namespace AllocationTracking
     //
     // Use case:
     //  `std::basic_stacktrace::current` will construct an internal vector with ~512KB of storage.
-    //  Since we need to get the stacktrace for each allocation, this gets time consuming and is expensive.
+    //  Since we need to get the stacktrace for each allocation, this can be very time consuming.
     //  This allocator will instead provide a pre-allocated buffer to avoid repeated allocations.
     //
     // Note:
     //  Caller will need to synchronize uses of this using the allocator's mutex.
     //
     template <typename ElemT>
-    struct ThreadLocalStaticSelfAllocator : std::allocator<ElemT>
+    struct ThreadLocalStackAllocator : std::allocator<ElemT>
     {
-        static constexpr std::size_t s_cBufferSize = (512 << 10); // 512KB
+        static constexpr std::size_t s_cMaxElementsSupported = 256;
+        static constexpr std::size_t s_cBufferSize = (sizeof(ElemT) * s_cMaxElementsSupported);
+
         inline static constinit thread_local std::array<std::uint8_t, s_cBufferSize> s_Buffer;
 
         [[nodiscard]] _Ret_notnull_ _Post_writable_size_(elems) constexpr ElemT* allocate(
@@ -81,6 +83,235 @@ namespace AllocationTracking
         }
     };
 }
+
+
+/*
+    std::basic_stacktrace::current's implementation is extremely problematic for our use case.
+    The crux of the issue is that it is pre-allocating a std::vector<std::stacktrace_entry, AllocT> with 0xFFFF
+    elements, like so:
+
+    >> static constexpr size_t _Max_frames = 0xFFFF;
+    ...
+    >> basic_stacktrace _Result{_Internal_t{}, _Max_frames, _Al};
+    >> const unsigned short _Actual_size = __std_stacktrace_capture(...);
+    >> _Result._Frames.resize(_Actual_size);
+    >> return _Result;
+
+    It's worth noting that the .resize call doesn't shrink the vector, it effectively just pop_back's all the unneeded elements.
+
+    The work needed to effectively zero-initialize ~512KB of memory is a bit slow when we're doing this for each allocation.
+
+    Due to this, I'm going to effectively copy-paste MSVC's implementation, but trim down the max amount of frames
+    we expect to hit.  65,535 frames seems excessive, while ~255 (0xFF) seems a bit more reasonable.  Even 1,024
+    frames (which still seems like quite a lot, at least for my use-case) would heaps better.
+*/
+namespace AllocationTracking
+{
+    template <typename _Alloc = ThreadLocalStackAllocator<std::stacktrace_entry>, std::size_t MaxFrames = ThreadLocalStackAllocator<std::stacktrace_entry>::s_cMaxElementsSupported>
+    class AllocStackTrace
+    {
+    private:
+        using _Frames_t = std::vector<std::stacktrace_entry, _Alloc>;
+
+    public:
+        using value_type = std::stacktrace_entry;
+        using const_reference = const value_type&;
+        using reference = value_type&;
+        using const_iterator = _Frames_t::const_iterator;
+        using iterator = const_iterator;
+        using reverse_iterator = _STD reverse_iterator<iterator>;
+        using const_reverse_iterator = _STD reverse_iterator<const_iterator>;
+        using difference_type = _Frames_t::difference_type;
+        using size_type = _Frames_t::size_type;
+        using allocator_type = _Alloc;
+
+        // __declspec(noinline) to make the same behavior for debug and release.
+        // We force the current function to be always noinline and add its frame to skipped.
+
+        _NODISCARD __declspec(noinline) static AllocStackTrace
+            current(const allocator_type& _Al = allocator_type()) noexcept {
+            _TRY_BEGIN
+                AllocStackTrace _Result{_Internal_t{}, _Max_frames, _Al};
+            const unsigned short _Actual_size = __std_stacktrace_capture(
+                1, static_cast<unsigned long>(_Max_frames), _Result._To_voidptr_array(), &_Result._Hash);
+            _Result._Frames.resize(_Actual_size);
+            return _Result;
+            _CATCH_ALL
+                return AllocStackTrace{_Al};
+            _CATCH_END
+        }
+
+        _NODISCARD __declspec(noinline) static AllocStackTrace
+            current(const size_type _Skip, const allocator_type& _Al = allocator_type()) noexcept {
+            _TRY_BEGIN
+                AllocStackTrace _Result{_Internal_t{}, _Max_frames, _Al};
+            const unsigned short _Actual_size = __std_stacktrace_capture(
+                _Adjust_skip(_Skip), static_cast<unsigned long>(_Max_frames), _Result._To_voidptr_array(), &_Result._Hash);
+            _Result._Frames.resize(_Actual_size);
+            return _Result;
+            _CATCH_ALL
+                return AllocStackTrace{_Al};
+            _CATCH_END
+        }
+
+        _NODISCARD __declspec(noinline) static AllocStackTrace
+            current(const size_type _Skip, size_type _Max_depth, const allocator_type& _Al = allocator_type()) noexcept {
+            _TRY_BEGIN
+                if (_Max_depth > _Max_frames) {
+                    _Max_depth = _Max_frames;
+                }
+
+            AllocStackTrace _Result{_Internal_t{}, _Max_depth, _Al};
+
+            const unsigned short _Actual_size = __std_stacktrace_capture(
+                _Adjust_skip(_Skip), static_cast<unsigned long>(_Max_depth), _Result._To_voidptr_array(), &_Result._Hash);
+            _Result._Frames.resize(_Actual_size);
+            return _Result;
+            _CATCH_ALL
+                return AllocStackTrace{_Al};
+            _CATCH_END
+        }
+
+        AllocStackTrace() noexcept(std::is_nothrow_default_constructible_v<allocator_type>) = default;
+        explicit AllocStackTrace(const allocator_type& _Al) noexcept : _Frames(_Al) {}
+
+        AllocStackTrace(const AllocStackTrace&) = default;
+        AllocStackTrace(AllocStackTrace&&) noexcept = default;
+        AllocStackTrace(const AllocStackTrace& _Other, const allocator_type& _Al)
+            : _Frames(_Other._Frames, _Al), _Hash(_Other._Hash) {}
+
+        AllocStackTrace(AllocStackTrace&& _Other, const allocator_type& _Al)
+            : _Frames(_STD move(_Other._Frames), _Al), _Hash(_Other._Hash) {}
+
+        AllocStackTrace& operator=(const AllocStackTrace&) = default;
+        AllocStackTrace& operator=(AllocStackTrace&&) noexcept(_Noex_move) = default;
+
+        ~AllocStackTrace() = default;
+
+        _NODISCARD allocator_type get_allocator() const noexcept {
+            return _Frames.get_allocator();
+        }
+
+        _NODISCARD const_iterator begin() const noexcept {
+            return _Frames.cbegin();
+        }
+
+        _NODISCARD const_iterator end() const noexcept {
+            return _Frames.cend();
+        }
+
+        _NODISCARD const_reverse_iterator rbegin() const noexcept {
+            return _Frames.crbegin();
+        }
+
+        _NODISCARD const_reverse_iterator rend() const noexcept {
+            return _Frames.crend();
+        }
+
+        _NODISCARD const_iterator cbegin() const noexcept {
+            return _Frames.cbegin();
+        }
+
+        _NODISCARD const_iterator cend() const noexcept {
+            return _Frames.cend();
+        }
+
+        _NODISCARD const_reverse_iterator crbegin() const noexcept {
+            return _Frames.crbegin();
+        }
+
+        _NODISCARD const_reverse_iterator crend() const noexcept {
+            return _Frames.crend();
+        }
+
+        _NODISCARD_EMPTY_STACKTRACE_MEMBER bool empty() const noexcept {
+            return _Frames.empty();
+        }
+
+        _NODISCARD size_type size() const noexcept {
+            return _Frames.size();
+        }
+
+        _NODISCARD size_type max_size() const noexcept {
+            return _Frames.max_size();
+        }
+
+        _NODISCARD const_reference operator[](const size_type _Sx) const noexcept /* strengthened */ {
+            return _Frames[_Sx];
+        }
+
+        _NODISCARD const_reference at(const size_type _Sx) const {
+            return _Frames.at(_Sx);
+        }
+
+        template <class _Al2>
+        _NODISCARD_FRIEND bool operator==(const AllocStackTrace& _Lhs, const AllocStackTrace<_Al2>& _Rhs) noexcept {
+            return _Lhs._Hash == _Rhs._Hash && _STD equal(_Lhs.begin(), _Lhs.end(), _Rhs.begin(), _Rhs.end());
+        }
+
+        template <class _Al2>
+        _NODISCARD_FRIEND std::strong_ordering operator<=>(
+            const AllocStackTrace& _Lhs, const AllocStackTrace<_Al2>& _Rhs) noexcept {
+            const auto _Result = _Lhs._Frames.size() <=> _Rhs._Frames.size();
+            if (_Result != std::strong_ordering::equal) {
+                return _Result;
+            }
+
+#ifdef __cpp_lib_concepts
+            return _STD lexicographical_compare_three_way(_Lhs.begin(), _Lhs.end(), _Rhs.begin(), _Rhs.end());
+#else // ^^^ defined(__cpp_lib_concepts) / !defined(__cpp_lib_concepts) vvv
+            for (size_t _Ix = 0, _Mx = _Lhs._Frames.size(); _Ix != _Mx; ++_Ix) {
+                if (_Lhs._Frames[_Ix] != _Rhs._Frames[_Ix]) {
+                    return _Lhs._Frames[_Ix] <=> _Rhs._Frames[_Ix];
+                }
+            }
+
+            return strong_ordering::equal;
+#endif // ^^^ !defined(__cpp_lib_concepts) ^^^
+        }
+
+        void swap(AllocStackTrace& _Other) noexcept(std::allocator_traits<_Alloc>::propagate_on_container_swap::value
+            || std::allocator_traits<_Alloc>::is_always_equal::value) {
+            _Frames.swap(_Other._Frames);
+            _STD swap(_Hash, _Other._Hash);
+        }
+
+        _NODISCARD unsigned long _Get_hash() const noexcept {
+            return _Hash;
+        }
+
+        _STL_INTERNAL_STATIC_ASSERT(sizeof(void*) == sizeof(std::stacktrace_entry));
+        _STL_INTERNAL_STATIC_ASSERT(alignof(void*) == alignof(std::stacktrace_entry));
+
+        _NODISCARD const void* const* _To_voidptr_array() const noexcept {
+            return reinterpret_cast<const void* const*>(_Frames.data());
+        }
+
+        _NODISCARD void** _To_voidptr_array() noexcept {
+            return reinterpret_cast<void**>(_Frames.data());
+        }
+
+    private:
+        static constexpr size_t _Max_frames = MaxFrames;
+
+        static constexpr bool _Noex_move = std::allocator_traits<_Alloc>::propagate_on_container_move_assignment::value
+            || std::allocator_traits<_Alloc>::is_always_equal::value;
+
+        struct _Internal_t {
+            explicit _Internal_t() noexcept = default;
+        };
+
+        AllocStackTrace(_Internal_t, size_type _Max_depth, const allocator_type& _Al) : _Frames(_Max_depth, _Al) {}
+
+        _NODISCARD static unsigned long _Adjust_skip(size_t _Skip) noexcept {
+            return _Skip < ULONG_MAX - 1 ? static_cast<unsigned long>(_Skip + 1) : ULONG_MAX;
+        }
+
+        _Frames_t _Frames;
+        unsigned long _Hash = 0;
+    };
+}
+
 
 namespace AllocationTracking
 {
@@ -237,12 +468,14 @@ namespace AllocationTracking
         --g_TrackingDisabledCount;
     }
 
-#pragma pack(push, 1)
+    static std::atomic<std::uint64_t> g_MemoryInfoId{0};
+
     struct [[nodiscard]] MemoryInfo
     {
         using Clock = std::chrono::system_clock;
         using TimePoint = decltype(Clock::now());
 
+        std::uint64_t m_Id{g_MemoryInfoId++};
         TimePoint m_Timestamp{Clock::now()};
         void* m_pMem{nullptr};
         std::size_t m_ByteCount{0};
@@ -255,93 +488,197 @@ namespace AllocationTracking
             return m_pMem < other.m_pMem;
         }
     };
-#pragma pack(pop)
 
-    class Tracker
+    struct [[nodiscard]] AtomicFlagSpinLock
     {
     private:
 
-        mutable std::mutex m_TrackerMutex;
+        std::atomic_flag m_bOwned{};
 
-        class WorkerThread
+        template <bool bAllowThreadYield>
+        void Acquire()
         {
-            friend class Tracker;
+            while (m_bOwned.test_and_set(std::memory_order::acquire))
+            {
+                if constexpr (/*bAllowThreadYield*/ false)
+                {
+                    // If this is the worker thread, yield to give cycles to the allocating threads.
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        void Release()
+        {
+            m_bOwned.clear(std::memory_order::release);
+        }
+
+    public:
+
+        template <bool bAllowThreadYield>
+        struct [[nodiscard]] ScopedAcquirer
+        {
+            AtomicFlagSpinLock* m_pAFSL;
+
+            ScopedAcquirer(_In_ AtomicFlagSpinLock* pAFSL) noexcept :
+                m_pAFSL{pAFSL}
+            {
+                m_pAFSL->Acquire<bAllowThreadYield>();
+            }
+
+            ~ScopedAcquirer() noexcept
+            {
+                m_pAFSL->Release();
+            }
+        };
+
+        template <bool bAllowThreadYield>
+        ScopedAcquirer<bAllowThreadYield> AcquireScoped() noexcept
+        {
+            return ScopedAcquirer<bAllowThreadYield>{this};
+        }
+    };
+
+    thread_local struct ThreadTracker
+    {
+        using Queue = std::deque<MemoryInfo, SelfAllocator<MemoryInfo>>;
+        Queue m_Queue;
+        AtomicFlagSpinLock m_bQueueBusy;
+        std::thread::id m_Tid{std::this_thread::get_id()};
+        bool m_bRegistered{false};
+
+        ~ThreadTracker()
+        {
+            if (m_bRegistered)
+            {
+                DeregisterWithGlobalTracker();
+            }
+        }
+
+        bool RegisterWithGlobalTracker();
+
+        void DeregisterWithGlobalTracker();
+
+        void AddToQueue(_Inout_ MemoryInfo&& info)
+        {
+            if (!RegisterWithGlobalTracker())
+            {
+                // If we haven't successfully registered, don't flood the queue.
+                return;
+            }
+
+            auto scopedSpinLock{m_bQueueBusy.AcquireScoped<false>()};
+            // std::lock_guard lock(m_QueueMutex);
+            m_Queue.push_back(std::move(info));
+        }
+    } gtl_ThreadTracker;
+
+    class GlobalTracker
+    {
+    private:
+
+        mutable AtomicFlagSpinLock m_TrackerSpinLock;
+        // mutable std::mutex m_TrackerMutex;
+
+        mutable class WorkerThread
+        {
+            friend class GlobalTracker;
 
         private:
 
-            using Queue = std::deque<MemoryInfo, SelfAllocator<MemoryInfo>>;
+            using ThreadTrackerRegistrationInfo = ThreadTracker*;
 
-            Queue m_Queue{};
-            std::mutex m_QueueMutex{};
-            std::condition_variable m_QueueCV{};
-            std::atomic<std::size_t> m_QueueLength{0};
+            // Populated by threads that have deregistered from GlobalTracker.
+            ThreadTracker::Queue m_BacklogQueue;
+            AtomicFlagSpinLock m_BacklogSpinLock;
+            // std::mutex m_BacklogQueueMutex;
+
+            std::deque<ThreadTrackerRegistrationInfo, SelfAllocator<ThreadTrackerRegistrationInfo>> m_ThreadTrackerRegistry;
+            // std::condition_variable m_ThreadTrackerRegistryCV;
+            AtomicFlagSpinLock m_ThreadTrackerRegistrySpinLock;
+            // std::mutex m_ThreadTrackerRegistryMutex;
+
             std::atomic<bool> m_bContinueWork{true};
+
+            // Used for when a LogAllocation request comes in and wishes to wait for current worker loop to complete.
+            AtomicFlagSpinLock m_WorkerThreadInProgress;
 
             // Note: It's important that this is last
             std::jthread m_Thread;
 
-            Queue WaitForWork()
+            bool WaitForWork()
             {
-                std::unique_lock lock{m_QueueMutex};
-                m_QueueCV.notify_all();
-                m_QueueCV.wait_for(lock, std::chrono::seconds(1));
-                Queue tmp;
-                std::swap(tmp, m_Queue);
-                return tmp;
+                static constexpr auto s_cWaitTimeMs{std::chrono::milliseconds(50)};
+                std::this_thread::sleep_for(s_cWaitTimeMs);
+                return m_bContinueWork;
+            }
+
+            ThreadTracker::Queue GetAllQueued()
+            {
+                ThreadTracker::Queue ret;
+                {
+                    auto scopedRegistrySpinLock{m_ThreadTrackerRegistrySpinLock.AcquireScoped<true>()};
+                    for (const auto pThreadTracker : m_ThreadTrackerRegistry)
+                    {
+                        auto scopedTTQueueSpinLock{pThreadTracker->m_bQueueBusy.AcquireScoped<true>()};
+                        std::ranges::move(pThreadTracker->m_Queue, std::back_inserter(ret));
+                        pThreadTracker->m_Queue.clear();
+                    }
+                }
+                {
+                    auto scopedBacklogSpinLock{m_BacklogSpinLock.AcquireScoped<true>()};
+                    std::ranges::move(m_BacklogQueue, std::back_inserter(ret));
+                    m_BacklogQueue.clear();
+                }
+
+                //
+                // Now that we're splicing together a list of allocs/frees spanning multiple threads,
+                // we need to ensure that the content is in order. This is to cover cases where one
+                // thread allocates memory, then passes ownership of that memory to another thread.
+                // Without this, we run the risk of processing the free before the allocation, which
+                // means we'll never stop tracking the since freed alloc.
+                //
+                // The simplest way to do this at the moment is using the timestamp.
+                // One concern is that it is currently std::chrono::system_clock, which is really just
+                // either GetSystemTimeAsFileTime (older, less precise) or GetSystemTimePreciseAsFileTime
+                // (more precise, <1us), but it's not clear if that's always available (e.g., older versions of Win).
+                //
+                // If this is insufficient, we could add an additional field to MemoryInfo that gets assigned an ID
+                // from a global atomic counter for each alloc/free, then sort off of that to establish a confirmed order.
+                // This would add yet another 8 byte overhead to allocation however - not ideal.
+                //
+                std::ranges::sort(ret, [](_In_ const MemoryInfo& lhs, _In_ const MemoryInfo& rhs) { return lhs.m_Id < rhs.m_Id; });
+
+                return ret;
             }
 
             void WorkerLoop()
             {
-                while (m_bContinueWork.load())
+                while (WaitForWork())
                 {
-                    auto work{WaitForWork()};
-                    if (work.empty())
-                    {
-                        continue;
-                    }
-
-                    const auto pTracker{Tracker::Instance()};
+                    auto scopedWorkInProgressSL{m_WorkerThreadInProgress.AcquireScoped<false>()};
+                    auto pTracker = GlobalTracker::InstanceIfTrackingEnabled();
                     if (!pTracker)
                     {
                         continue;
                     }
 
-                    std::unique_lock lock{pTracker->m_TrackerMutex};
-                    for (auto& info : work)
+                    auto queue{GetAllQueued()};
+                    if (queue.empty())
                     {
-                        if (!m_bContinueWork.load())
+                        continue;
+                    }
+
+                    auto scopedSpinLock{pTracker->m_TrackerSpinLock.AcquireScoped<true>()};
+                    for (auto& info : queue)
+                    {
+                        if (!m_bContinueWork)
                         {
                             return;
                         }
 
                         pTracker->ProcessMemoryInfoUnsafe(std::move(info));
-                        --m_QueueLength;
                     }
-                }
-            }
-
-            void EnqueueAndNotifyUnsafe(_Inout_ MemoryInfo&& item)
-            {
-                using Clock = std::chrono::steady_clock;
-                static constinit std::uint64_t s_BytesInFlightSinceLastNotify = 0;
-                static constinit std::uint64_t s_ItemsInFlightSinceLastNotify = 0;
-                static auto s_LastNotifyTime = Clock::now();
-
-                const auto now{Clock::now()};
-
-                s_BytesInFlightSinceLastNotify += item.m_ByteCount;
-                ++s_ItemsInFlightSinceLastNotify;
-                m_Queue.push_back(std::move(item));
-                ++m_QueueLength;
-
-                if ((s_BytesInFlightSinceLastNotify >= (1 << 20)) ||
-                    (s_ItemsInFlightSinceLastNotify > 1000) ||
-                    ((s_LastNotifyTime - now) > std::chrono::seconds(1)))
-                {
-                    s_BytesInFlightSinceLastNotify = 0;
-                    s_ItemsInFlightSinceLastNotify = 0;
-                    s_LastNotifyTime = now;
-                    m_QueueCV.notify_one();
                 }
             }
 
@@ -366,34 +703,44 @@ namespace AllocationTracking
             void SignalStop(_In_ const bool bWait)
             {
                 m_bContinueWork = false;
-                m_QueueCV.notify_one();
                 if (bWait && m_Thread.joinable())
                 {
                     m_Thread.join();
                 }
             }
 
-            void Enqueue(_Inout_ MemoryInfo&& item)
+            void RegisterThreadTracker(_In_ ThreadTracker* pThreadTracker)
             {
-                std::lock_guard lock{m_QueueMutex};
-                EnqueueAndNotifyUnsafe(std::move(item));
+                const auto scopedSpinLock{m_ThreadTrackerRegistrySpinLock.AcquireScoped<false>()};
+                // std::lock_guard lock{m_ThreadTrackerRegistryMutex};
+                m_ThreadTrackerRegistry.emplace_back(pThreadTracker);
+            }
+
+            void DeregisterThreadTracker(_In_ ThreadTracker* pThreadTracker)
+            {
+                {
+                    const auto scopedSpinLock{m_ThreadTrackerRegistrySpinLock.AcquireScoped<false>()};
+                    const auto registrationItr = std::ranges::find(m_ThreadTrackerRegistry, pThreadTracker);
+                    if (registrationItr != m_ThreadTrackerRegistry.end())
+                    {
+                        std::swap(*registrationItr, m_ThreadTrackerRegistry.back());
+                        m_ThreadTrackerRegistry.pop_back();
+                    }
+                }
+
+                // Move any queued alloc/dealloc's to the backlog queue.
+                auto tmpQueue = [pThreadTracker]()
+                {
+                    const auto scopedSpinLock{pThreadTracker->m_bQueueBusy.AcquireScoped<false>()};
+                    ThreadTracker::Queue tmp{std::move(pThreadTracker->m_Queue)};
+                    pThreadTracker->m_Queue.clear();
+                    return tmp;
+                }();
+
+                const auto scopedSpinLock{m_BacklogSpinLock.AcquireScoped<false>()};
+                std::ranges::move(tmpQueue, std::back_inserter(m_BacklogQueue));
             }
         } m_WorkerThread;
-
-    public:
-
-#if defined _DEBUG
-        //
-        // This is needed for _DEBUG, since MSVC's std::stacktrace appears to perform debug-related
-        // allocations during default construction.  W/o this, we crash due to infinite recursion on
-        // the next allocation once tracking is enabled.
-        //
-        // Rather inconvenient.
-        //
-        using AllocStackTrace = std::basic_stacktrace<NonTrackingAllocator<std::stacktrace_entry>>;
-#else
-        using AllocStackTrace = std::basic_stacktrace<ThreadLocalStaticSelfAllocator<std::stacktrace_entry>>;
-#endif
 
     private:
 
@@ -648,13 +995,12 @@ namespace AllocationTracking
 
             const auto trackerAllocCount = m_InternalAllocationCount.load();
             const auto trackerByteCount = m_InternalAllocationByteCount.load();
-            logLines += std::format("\n\n  Total External[{} : {} ({})]\n  Total Tracker[{} : {} ({}) (~{}/ExtAlloc)]\n  Tracker Queue[{}]",
+            logLines += std::format("\n\n  Total External[{} : {} ({})]\n  Total Tracker[{} : {} ({}) (~{}/ExtAlloc)]\n",
                 FmtDec{}(overallAllocSummaryInfo.m_TotalAllocations),
                 FmtByteUpToMebibyte{}(overallAllocSummaryInfo.m_TotalBytes), FmtByte{}(overallAllocSummaryInfo.m_TotalBytes),
                 FmtDec{}(trackerAllocCount),
                 FmtByteUpToMebibyte{}(trackerByteCount), FmtByte{}(trackerByteCount),
-                FmtByte{}(BytesPerAllocationAverage(trackerByteCount, overallAllocSummaryInfo.m_TotalAllocations)),
-                m_WorkerThread.m_QueueLength.load());
+                FmtByte{}(BytesPerAllocationAverage(trackerByteCount, overallAllocSummaryInfo.m_TotalAllocations)));
 
             logLines += "\n\n==================================================\n\n"sv;
 
@@ -724,43 +1070,29 @@ namespace AllocationTracking
         {
             if (!!(info.m_FlagMask & AllocFlag::Free))
             {
-                //
-                // Note:
-                //
-                //  If `free` performance becomes an issue, we could speed this up by caching
-                //  the STE (and potentially the MemoryInfoSet iterator) that each alloc corresponds to.
-                //
-                //  This would allow logarithmic/constant in `free` case, but require quite a bit extra memory overhead.
-                //  For std::map that's 48/56 bytes per allocation.
-                //
                 const auto cachedInfoItr = m_AllocationAddrToCachedInfoMap.find(info.m_pMem);
                 if (cachedInfoItr != m_AllocationAddrToCachedInfoMap.end())
                 {
                     const auto [hashMapKey, infoSetItr] = cachedInfoItr->second;
-                    m_StackTraceEntryToMemoryInfoSetMap[hashMapKey].erase(infoSetItr);
+                    const auto hashMapItr = m_StackTraceEntryToMemoryInfoSetMap.find(hashMapKey);
+                    if (hashMapItr != m_StackTraceEntryToMemoryInfoSetMap.end())
+                    {
+                        if (hashMapItr->second.size() <= 1)
+                        {
+                            m_StackTraceEntryToMemoryInfoSetMap.erase(hashMapItr);
+                        }
+                        else
+                        {
+                            hashMapItr->second.erase(infoSetItr);
+                        }
+                    }
                     m_AllocationAddrToCachedInfoMap.erase(cachedInfoItr);
                 }
                 else
                 {
-                    // We didn't have the cached info.
-                    // Not expected - exhaustively search the hash map.
-                    __debugbreak();
-                    for (auto& [steKey, allocPackageSet] : m_StackTraceEntryToMemoryInfoSetMap)
-                    {
-                        if (allocPackageSet.empty())
-                        {
-                            continue;
-                        }
-
-                        const auto setItr = allocPackageSet.find(info);
-                        if (setItr == allocPackageSet.end())
-                        {
-                            continue;
-                        }
-
-                        allocPackageSet.erase(setItr);
-                        return;
-                    }
+                    // A few possibilities:
+                    //  1) Allocation occurred while tracking was disabled.
+                    //  2) Someone allocated with `new`, but deallocated with `free`.
                 }
             }
             else
@@ -784,30 +1116,26 @@ namespace AllocationTracking
             }
         }
 
-        static std::atomic<std::shared_ptr<Tracker>> s_pTracker;
+        static std::shared_ptr<GlobalTracker> s_pTracker;
 
     public:
 
         static void Init()
         {
-            if (!s_pTracker.load())
-            {
-                std::shared_ptr<Tracker> expected{nullptr};
-                s_pTracker.compare_exchange_strong(expected, std::make_shared<Tracker>());
-            }
+            s_pTracker = std::make_shared<GlobalTracker>();
         }
 
         static void DeInit()
         {
-            s_pTracker.store(nullptr);
+            s_pTracker.reset();
         }
 
-        [[nodiscard]] static std::shared_ptr<Tracker> Instance() noexcept
+        [[nodiscard]] static std::shared_ptr<GlobalTracker> Instance() noexcept
         {
-            return s_pTracker.load();
+            return s_pTracker;
         }
 
-        [[nodiscard]] static std::shared_ptr<Tracker> InstanceIfTrackingEnabled(_In_ const AllocFlag flags = {}) noexcept
+        [[nodiscard]] static std::shared_ptr<GlobalTracker> InstanceIfTrackingEnabled(_In_ const AllocFlag flags = {}) noexcept
         {
             if (!!(flags & AllocFlag::SelfAlloc))
             {
@@ -837,16 +1165,47 @@ namespace AllocationTracking
             return Instance();
         }
 
-        __declspec(noinline) void Track(_In_ MemoryInfo info)
+        void AddExternalStackEntryMarker(_In_ const std::string_view markerSV)
         {
+            auto scopedSpinLock{m_TrackerSpinLock.AcquireScoped<false>()};
+            // std::unique_lock lock{m_TrackerMutex};
+            AddExternalStackEntryMarkerUnsafe(std::string{markerSV});
+        }
+
+        void AddExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
+        {
+            auto scopedSpinLock{m_TrackerSpinLock.AcquireScoped<false>()};
+            // std::unique_lock lock{m_TrackerMutex};
+            std::ranges::for_each(markers, [this](const auto markerSV) { AddExternalStackEntryMarkerUnsafe(std::string{markerSV}); });
+        }
+
+        void CollectFullStackTraces(_In_ const bool bCollect)
+        {
+            m_bCollectFullStackTraces = bCollect;
+        }
+
+        void RegisterThreadTracker(_In_ ThreadTracker* pTT)
+        {
+            m_WorkerThread.RegisterThreadTracker(pTT);
+        }
+
+        void DeregisterThreadTracker(_In_ ThreadTracker* pTT)
+        {
+            m_WorkerThread.DeregisterThreadTracker(pTT);
+        }
+
+        void Track(_Inout_ MemoryInfo&& info)
+        {
+            const bool bIsFree = !!(info.m_FlagMask & AllocFlag::Free);
+
+            if (!!(info.m_FlagMask & AllocFlag::NoTracking))
+            {
+                return;
+            }
             if (!!(info.m_FlagMask & AllocFlag::SelfAlloc))
             {
-                if (info.m_ByteCount == 0)
-                {
-                    throw std::logic_error("Internal AllocPackage is missing byte count");
-                }
-
-                if (!!(info.m_FlagMask & AllocFlag::Free))
+                // We don't queue these up, just update internal self-alloc counters.
+                if (bIsFree)
                 {
                     m_InternalAllocationByteCount -= info.m_ByteCount;
                     --m_InternalAllocationCount;
@@ -860,60 +1219,70 @@ namespace AllocationTracking
                 return;
             }
 
-            if (!(info.m_FlagMask & AllocFlag::Free))
+            if (!bIsFree)
             {
-                info.m_StackTrace = AllocStackTrace::current(1);
+                info.m_StackTrace = AllocStackTrace<>::current(1);
             }
 
-            m_WorkerThread.Enqueue(std::move(info));
-        }
-
-        void AddExternalStackEntryMarker(_In_ const std::string_view markerSV)
-        {
-            std::unique_lock lock{m_TrackerMutex};
-            AddExternalStackEntryMarkerUnsafe(std::string{markerSV});
-        }
-
-        void AddExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
-        {
-            std::unique_lock lock{m_TrackerMutex};
-            std::ranges::for_each(markers, [this](const auto markerSV) { AddExternalStackEntryMarkerUnsafe(std::string{markerSV}); });
-        }
-
-        void CollectFullStackTraces(_In_ const bool bCollect)
-        {
-            m_bCollectFullStackTraces = bCollect;
+            gtl_ThreadTracker.AddToQueue(std::move(info));
         }
 
         void LogSummary(
             _In_ const LogCallback& logFn,
-            _In_ const LogSummaryType type) const
+            _In_ const LogSummaryType type,
+            _In_ const bool waitForWorkerThreadLull) const
         {
-            std::unique_lock lock{m_TrackerMutex};
+            if (waitForWorkerThreadLull)
+            {
+                auto waitSpinScoped{m_WorkerThread.m_WorkerThreadInProgress.AcquireScoped<true>()};
+            }
+            auto scopedSpinLock{m_TrackerSpinLock.AcquireScoped<false>()};
+            // std::unique_lock lock{m_TrackerMutex};
             ScopedThreadLocalTrackingDisabler stltd;
             LogSummaryUnsafe(logFn, type);
         }
-
-        void WaitForQueueEmpty()
-        {
-            std::unique_lock lock{m_WorkerThread.m_QueueMutex};
-            m_WorkerThread.m_QueueCV.wait(lock, [this]() { return m_WorkerThread.m_QueueLength == 0; });
-        }
     };
+
+
+    bool ThreadTracker::RegisterWithGlobalTracker()
+    {
+        if (m_bRegistered)
+        {
+            return true;
+        }
+        auto pGlobalTracker = GlobalTracker::Instance();
+        if (!!pGlobalTracker)
+        {
+            pGlobalTracker->RegisterThreadTracker(this);
+            m_bRegistered = true;
+        }
+
+        return m_bRegistered;
+    }
+
+    void ThreadTracker::DeregisterWithGlobalTracker()
+    {
+        auto pGlobalTracker = GlobalTracker::Instance();
+        if (!!pGlobalTracker)
+        {
+            pGlobalTracker->DeregisterThreadTracker(this);
+            m_bRegistered = false;
+        }
+    }
 
     ScopedTrackerInit::ScopedTrackerInit()
     {
-        Tracker::Init();
+        GlobalTracker::Init();
     }
 
     ScopedTrackerInit::~ScopedTrackerInit()
     {
-        Tracker::DeInit();
+        GlobalTracker::DeInit();
     }
 
     void RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV)
     {
-        auto pTracker = Tracker::Instance();
+        auto pTracker = GlobalTracker::Instance();
         if (!!pTracker)
         {
             pTracker->AddExternalStackEntryMarker(markerSV);
@@ -922,7 +1291,7 @@ namespace AllocationTracking
 
     void RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
     {
-        auto pTracker = Tracker::Instance();
+        auto pTracker = GlobalTracker::Instance();
         if (!!pTracker)
         {
             pTracker->AddExternalStackEntryMarkers(markers);
@@ -931,7 +1300,7 @@ namespace AllocationTracking
 
     void CollectFullStackTraces(_In_ const bool bCollect)
     {
-        auto pTracker = Tracker::Instance();
+        auto pTracker = GlobalTracker::Instance();
         if (!!pTracker)
         {
             pTracker->CollectFullStackTraces(bCollect);
@@ -965,11 +1334,11 @@ namespace AllocationTracking
     {
         // 1. Don't allow zero-size alloc
         // 2. _aligned_malloc requires alignment to be power of 2
-        // 3. We store alignment as uint16_t, ensure provided arg meets constraint.
+        // 3. Ensure alignment doesn't overflow.
         const bool bCanThrow = !(flags & AllocFlag::NoThrow);
         if ((byteCount == 0) ||
             !IsPowerOfTwo(alignment) ||
-            (static_cast<std::size_t>(alignment) > (std::numeric_limits<std::uint16_t>::max)()))
+            (static_cast<std::size_t>(alignment) > (std::numeric_limits<decltype(MemoryInfo::m_Alignment)>::max)()))
         {
             if (bCanThrow)
             {
@@ -981,7 +1350,7 @@ namespace AllocationTracking
 
         static constexpr auto s_cMaxU8{(std::numeric_limits<std::uint8_t>::max)()};
         const auto alignmentU8 = static_cast<std::uint8_t>(
-            (std::max)(
+            (std::min)(
                 static_cast<std::size_t>(alignment),
                 static_cast<std::size_t>(s_cMaxU8)));
 
@@ -998,10 +1367,10 @@ namespace AllocationTracking
             return nullptr;
         }
 
-        const auto pTracker = Tracker::InstanceIfTrackingEnabled(flags);
-        if (!!pTracker)
+        auto pGlobalTracker = GlobalTracker::InstanceIfTrackingEnabled(flags);
+        if (!!pGlobalTracker)
         {
-            pTracker->Track(
+            pGlobalTracker->Track(
                 MemoryInfo{
                     .m_pMem = pMem,
                     .m_ByteCount = byteCount,
@@ -1022,14 +1391,14 @@ namespace AllocationTracking
             return;
         }
 
-        const auto pTracker = Tracker::InstanceIfTrackingEnabled(flags);
-        if (!!pTracker)
+        auto pGlobalTracker = GlobalTracker::InstanceIfTrackingEnabled(flags);
+        if (!!pGlobalTracker)
         {
-            pTracker->Track(
+            pGlobalTracker->Track(
                 MemoryInfo{
-                    .m_pMem = pMem,
-                    .m_ByteCount = byteCount,
-                    .m_FlagMask = (flags | AllocFlag::Free)});
+                .m_pMem = pMem,
+                .m_ByteCount = byteCount,
+                .m_FlagMask = (flags | AllocFlag::Free)});
         }
 
         !!(flags & AllocFlag::CustomAlignment) ? _aligned_free(pMem) : free(pMem);
@@ -1038,20 +1407,14 @@ namespace AllocationTracking
     void LogAllocations(
         _In_ const LogCallback& logFn,
         _In_ const LogSummaryType type,
-        _In_ const bool bWaitForQueueEmpty /* = false */)
+        _In_ const bool bWaitForWorkerThreadLull /* = false */)
     {
-        const auto pTracker = Tracker::Instance();
-        if (!pTracker)
+        const auto pTracker = GlobalTracker::Instance();
+        if (!!pTracker)
         {
-            return;
+            pTracker->LogSummary(logFn, type, bWaitForWorkerThreadLull);
         }
-
-        if (bWaitForQueueEmpty)
-        {
-            pTracker->WaitForQueueEmpty();
-        }
-        pTracker->LogSummary(logFn, type);
     }
 }
 
-std::atomic<std::shared_ptr<AllocationTracking::Tracker>> AllocationTracking::Tracker::s_pTracker{nullptr};
+std::shared_ptr<AllocationTracking::GlobalTracker> AllocationTracking::GlobalTracker::s_pTracker{nullptr};

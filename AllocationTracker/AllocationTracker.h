@@ -156,7 +156,7 @@ namespace AllocationTracking
     void LogAllocations(
         _In_ const LogCallback& logFn,
         _In_ const LogSummaryType type,
-        _In_ const bool bWaitForQueueEmpty = false);
+        _In_ const bool waitForWorkerThreadLull = false);
 }
 
 

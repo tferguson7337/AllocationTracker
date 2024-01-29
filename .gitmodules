@@ -1,0 +1,3 @@
+[submodule "AllocationTracker/Detours"]
+	path = AllocationTracker/Detours
+	url = https://github.com/microsoft/Detours.git

@@ -133,55 +133,63 @@ namespace AllocationTracking
 {
     bool GlobalTracker::WorkerThread::WaitForWork()
     {
-        static constexpr auto s_cWaitTimeMs{std::chrono::milliseconds(50)};
+        static constexpr auto s_cWaitTimeMs{std::chrono::milliseconds(500)};
         std::this_thread::sleep_for(s_cWaitTimeMs);
         return m_bContinueWork;
     }
 
     MemoryInfoQueue GlobalTracker::WorkerThread::GetAllQueued()
     {
-        MemoryInfoQueue ret;
+        using MemoryInfoQueueVector = std::vector<MemoryInfoQueue, SelfAllocator<MemoryInfoQueue>>;
+        MemoryInfoQueueVector queuesToMerge = [this]()
         {
-            auto scopedRegistryLock{m_ThreadTrackerRegistryLock.AcquireScoped()};
-            for (const auto pThreadTracker : m_ThreadTrackerRegistry)
+            MemoryInfoQueueVector tmp;
+
+            // Handle registered ThreadTracker queues.
             {
-                auto scopedTTQueueLock{pThreadTracker->m_QueueBusyLock.AcquireScoped()};
-                TransferMemoryInfoQueue(ret, pThreadTracker->m_Queue);
+                auto scopedRegistryLock{m_ThreadTrackerRegistryLock.AcquireScoped()};
+                tmp.reserve(m_ThreadTrackerRegistry.size() + 2); // + 2 for the backlog and deregistered free queues
+                for (const auto pThreadTracker : m_ThreadTrackerRegistry)
+                {
+                    auto scopedTTQueueLock{pThreadTracker->m_QueueBusyLock.AcquireScoped()};
+                    tmp.push_back(std::move(pThreadTracker->m_Queue));
+                    pThreadTracker->m_Queue = {};
+                }
             }
-        }
-        {
-            auto scopedBacklogLock{m_BacklogLock.AcquireScoped()};
-            TransferMemoryInfoQueue(ret, m_BacklogQueue);
-        }
-        {
-            auto queue = [this]()
+
+            // Handle m_BacklogQueue
             {
-                DeregisteredMemoryFreeInfoQueue tmp;
-                auto scopedDeregisteredFreeQueueLock{m_DeregisteredFreeQueueLock.AcquireScoped()};
-                std::swap(tmp, m_DeregisteredFreeQueue);
-                return tmp;
-            }();
-            queue.TransferTo(ret);
-        }
+                auto scopedBacklogLock{m_BacklogLock.AcquireScoped()};
+                tmp.push_back(std::move(m_BacklogQueue));
+                m_BacklogQueue = {};
+            }
 
+            // Handle m_DeregisteredFreeQueue
+            {
+                DeregisteredMemoryFreeInfoQueue dmfiq;
+                {
+                    auto scopedDeregisteredFreeQueueLock{m_DeregisteredFreeQueueLock.AcquireScoped()};
+                    std::swap(dmfiq, m_DeregisteredFreeQueue);
+                }
+                MemoryInfoQueue miq;
+                dmfiq.TransferTo(miq);
+                tmp.push_back(std::move(miq));
+            }
 
-        //
-        // TODO:
-        //
-        //  This sort is inefficient. Instead of splicing together all of the lists into one, and then sorting,
-        //  we should be taking advantage of the fact that each thread's list is already id-sorted prior to splice.
-        //  See std::merge, but we might want to write our own implementation that does an in-place merge to avoid
-        //  needing to reserve space for a new output-container for each pair of lists we end up merging, that way
-        //  we can just collapse all of the lists together more efficiently. Taking advantage of splice could avoid
-        //  reallocations since we'll just be 
-        //
-        auto SortById = [](_In_ const MemoryInfo& lhs, _In_ const MemoryInfo& rhs)
+            return tmp;
+        }();
+
+        MemoryInfoQueue merged;
+        std::ranges::for_each(queuesToMerge, [&merged](_In_ MemoryInfoQueue& toMerge)
         {
-            return lhs.m_Id < rhs.m_Id;
-        };
-        ret.sort(SortById);
+            auto SortById = [](_In_ const MemoryInfo& lhs, _In_ const MemoryInfo& rhs)
+            {
+                return lhs.m_Id < rhs.m_Id;
+            };
+            merged.merge(toMerge, SortById);
+        });
 
-        return ret;
+        return merged;
     }
 
     void GlobalTracker::WorkerThread::WorkerLoop()
@@ -277,7 +285,7 @@ namespace AllocationTracking
         // Move any queued alloc/dealloc's to the backlog queue.
         auto scopedBacklogLock{m_BacklogLock.AcquireScoped()};
         auto scopedThreadTrackerQueueLock{pThreadTracker->m_QueueBusyLock.AcquireScoped()};
-        TransferMemoryInfoQueue(m_BacklogQueue, pThreadTracker->m_Queue);
+        m_BacklogQueue.splice(m_BacklogQueue.end(), pThreadTracker->m_Queue);
     }
 
 

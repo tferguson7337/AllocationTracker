@@ -39,7 +39,7 @@ void GenerateLoggers()
     }
 
     using namespace std::literals::string_view_literals;
-    static constexpr auto s_cFileLoggerPath{LR"(C:\users\tferg\desktop\AllocationTrackingLog.txt)"sv};
+    static constexpr auto s_cFileLoggerPath{LR"(.\AllocationTrackingLog.txt)"sv};
     std::filesystem::remove(s_cFileLoggerPath);
 
     g_pDispatchLogger = SLL::Factory<SLL::DispatchLogger>{}(
@@ -47,7 +47,7 @@ void GenerateLoggers()
         SLL::Factory<SLL::FileLogger>{}(s_cFileLoggerPath));
 }
 
-static constexpr std::size_t s_cTestBuffersArrayLength{128};
+static constexpr std::size_t s_cTestBuffersArrayLength{64};
 using TestBuffers = std::vector<std::vector<std::uint8_t>>;
 using TestBuffersArray = std::array<TestBuffers, s_cTestBuffersArrayLength>;
 std::unique_ptr<TestBuffersArray> g_pTestBuffers;

@@ -737,11 +737,6 @@ namespace AllocationTracking
 namespace AllocationTracking
 {
     using MemoryInfoQueue = std::list<MemoryInfo, SelfAllocator<MemoryInfo>>;
-    inline void TransferMemoryInfoQueue(_Inout_ MemoryInfoQueue& recipient, _Inout_ MemoryInfoQueue& donor)
-    {
-        static_assert(std::same_as<MemoryInfoQueue, std::list<MemoryInfo, SelfAllocator<MemoryInfo>>>);
-        recipient.splice(recipient.end(), std::move(donor));
-    }
 
     struct ThreadTracker
     {

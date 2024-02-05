@@ -126,12 +126,33 @@ namespace AllocationTracking
         return info.m_pMem;
     }
 
+    static void* HandleCommonAllocTracking(_Inout_ ReallocMemoryInfo&& info)
+    {
+        auto pTracker{GlobalTracker::InstanceIfTrackingEnabled()};
+        if (!pTracker)
+        {
+            return info.m_pMem;
+        }
+
+        auto [syntheticFree, syntheticAlloc] = info.Synthesize();
+        if (!!syntheticFree.m_pMem)
+        {
+            pTracker->TrackDeallocation(std::move(syntheticFree));
+        }
+        if (!!syntheticAlloc.m_pMem)
+        {
+            pTracker->TrackAllocation(std::move(syntheticAlloc));
+        }
+
+        return info.m_pMem;
+    }
+
 
     LPVOID WINAPI HeapAllocDetour(HANDLE hHeap, DWORD dwFlags, SIZE_T bytes)
     {
         //
         // Note:
-        //  TIL that HeapAlloc can be naturally entrant.
+        //  TIL that HeapAlloc can be naturally re-entrant.
         //  There are some internal flags that get used, namely 0x0080'0000,
         //  combined with HEAP_NO_SERIALIZE (0x1).
         //
@@ -167,7 +188,7 @@ namespace AllocationTracking
             ScopedReentryCountIncrementer scopedReentryCountIncrementer;
             MemoryInfo info{
                 .m_pMem = s_RealHeapAlloc(hHeap, dwFlags, bytes),
-                .m_ByteCount = bytes,
+                .m_Bytes = bytes,
                 .m_OpFlagMask = s_OpFlag};
             return info;
         };
@@ -191,13 +212,11 @@ namespace AllocationTracking
             const SIZE_T originalBytes{HeapSize(hHeap, dwFlags, ptr)};
 
             ScopedReentryCountIncrementer scopedReentryCountIncrementer;
-            MemoryInfo info{
+            ReallocMemoryInfo info{
+                .m_pOriginalMem = ptr,
+                .m_OriginalBytes = originalBytes,
                 .m_pMem = s_RealHeapReAlloc(hHeap, dwFlags, ptr, bytes),
-                .m_ByteCount = bytes,
-                .m_ReallocInfo = ReallocInfo{
-                    .m_pOriginalMem = ptr,
-                    .m_OriginalBytes = originalBytes},
-                .m_OpFlagMask = s_OpFlag};
+                .m_Bytes = bytes};
             return info;
         };
         return HandleCommonAllocTracking(ReAllocTs());
@@ -227,7 +246,7 @@ namespace AllocationTracking
                         pTracker->AddToDeregisteredFreeQueue(
                             DeregisteredMemoryFreeInfo{
                                 .m_pMem = ptr,
-                                .m_ByteCount = HeapSize(hHeap, dwFlags, ptr)});
+                                .m_Bytes = HeapSize(hHeap, dwFlags, ptr)});
                     }
                 }
             }
@@ -247,7 +266,7 @@ namespace AllocationTracking
 
             MemoryInfo info{
                 .m_pMem = ptr,
-                .m_ByteCount = bytes,
+                .m_Bytes = bytes,
                 .m_OpFlagMask = s_OpFlag};
             return info;
         };

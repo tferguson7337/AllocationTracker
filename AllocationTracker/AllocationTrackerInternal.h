@@ -50,11 +50,11 @@ namespace AllocationTracking
         }
     };
 
-    extern std::atomic<std::uint64_t> g_InternalAllocations;
-    extern std::atomic<std::uint64_t> g_InternalAllocationBytes;
+    extern std::atomic<std::int64_t> g_InternalAllocations;
+    extern std::atomic<std::int64_t> g_InternalAllocationBytes;
 
-    extern std::atomic<std::uint64_t> g_ExternalAllocations;
-    extern std::atomic<std::uint64_t> g_ExternalAllocationBytes;
+    extern std::atomic<std::int64_t> g_ExternalAllocations;
+    extern std::atomic<std::int64_t> g_ExternalAllocationBytes;
 
     extern std::atomic<bool> g_bTrackingEnabled;
 }
@@ -126,11 +126,15 @@ namespace AllocationTracking
     using StdStackTraceWithAllocatorT = std::basic_stacktrace<AllocT>;
 
     //
-    // We need our own trimmed down `std::basic_stacktrace`, since with MSVC it rather annoyingly overallocates
-    // its internal std::vector with 0xFFFF capacity when you call `current`, but doesn't shrink_to_fit.
-    // Even if you call `current` with max_depth specified, it'll allocate max_depth elements and never shrink.
-    // If we don't do this, every tracked allocation would take ~512KB or (max_depth * sizeof(void*)).
-    // At the very least we can deal with the temporary alloc from `current` and copy just what we need to a smaller buffer.
+    // Note:
+    //  We need our own trimmed down `std::basic_stacktrace`, since with MSVC it rather annoyingly overallocates
+    //  its internal std::vector with 0xFFFF capacity when you call `current`, but doesn't shrink_to_fit.
+    //  Even if you call `current` with max_depth specified, it'll allocate max_depth elements and never shrink.
+    //  If we don't do this, every tracked allocation would take ~512KB or (max_depth * sizeof(void*)).
+    //  At the very least we can deal with the temporary alloc from `current` and copy just what we need to a smaller buffer.
+    //
+    // Note:
+    //  Using this struct also lowers the memory footprint of `MemoryInfo` (16 vs 24 bytes)
     //
     struct [[nodiscard]] StackTraceEntryArray
     {
@@ -298,12 +302,6 @@ namespace AllocationTracking
         Free = 0x4
     };
 
-    struct [[nodiscard]] ReallocInfo
-    {
-        void* m_pOriginalMem{nullptr};
-        std::size_t m_OriginalBytes{0};
-    };
-
     struct [[nodiscard]] MemoryInfo
     {
         inline static std::atomic<uint64_t> s_IdCounter{0};
@@ -312,14 +310,51 @@ namespace AllocationTracking
         using TimePoint = decltype(Clock::now());
 
         std::uint64_t m_Id{s_IdCounter++};
-        std::thread::id m_OriginThread{std::this_thread::get_id()};
-        void* m_pMem{nullptr};
-        std::size_t m_ByteCount{0};
         TimePoint m_Timestamp{Clock::now()};
-        StackTraceT m_StackTrace;
-        ReallocInfo m_ReallocInfo; // Only valid if OpFlag::Realloc is set.
+        void* m_pMem{nullptr};
+        std::size_t m_Bytes{0};
+        StackTraceT m_StackTrace{};
         OpFlag m_OpFlagMask{OpFlag::None};
     };
+
+    struct [[nodiscard]] ReallocMemoryInfo
+    {
+        void* m_pOriginalMem{nullptr};
+        std::size_t m_OriginalBytes{0};
+
+        void* m_pMem{nullptr};
+        std::size_t m_Bytes{0};
+
+        //
+        // For the Realloc case, we'll generate a synthetic "Free" MemoryInfo
+        // for the original address and bytes, as well as the new "Alloc" for
+        // the (maybe) new address and bytes.
+        //
+        // This simplifies Tracker impl for Realloc cases, as well as trims
+        // down MemoryInfo size for the more common Alloc and Free cases.
+        //
+        std::pair<MemoryInfo, MemoryInfo> Synthesize() const noexcept
+        {
+            const auto timestamp{MemoryInfo::Clock::now()};
+            return
+            {
+                MemoryInfo{
+                    .m_Id = MemoryInfo::s_IdCounter++,
+                    .m_Timestamp = timestamp,
+                    .m_pMem = m_pOriginalMem,
+                    .m_Bytes = m_OriginalBytes,
+                    .m_OpFlagMask = OpFlag::Free},
+                MemoryInfo{
+                    .m_Id = MemoryInfo::s_IdCounter++,
+                    .m_Timestamp = timestamp,
+                    .m_pMem = m_pMem,
+                    .m_Bytes = m_Bytes,
+                    .m_OpFlagMask = OpFlag::Alloc}
+            };
+        }
+    };
+
+
 
     template <typename KeyT>
     concept ValidMemoryInfoKey =
@@ -373,14 +408,14 @@ namespace AllocationTracking
     {
         std::uint64_t m_Id{MemoryInfo::s_IdCounter++};
         void* m_pMem{nullptr};
-        std::size_t m_ByteCount{0};
+        std::size_t m_Bytes{0};
 
         [[nodiscard]] MemoryInfo ConvertToMemoryInfo() const noexcept
         {
             return MemoryInfo{
                 .m_Id = m_Id,
                 .m_pMem = m_pMem,
-                .m_ByteCount = m_ByteCount};
+                .m_Bytes = m_Bytes};
         }
     };
 

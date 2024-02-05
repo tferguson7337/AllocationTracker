@@ -28,11 +28,11 @@ namespace AllocationTracking
     thread_local std::int64_t gtl_IsInternalAllocationOrFree{0};
     thread_local std::int64_t gtl_IsNoTrackAllocationOrFree{0};
 
-    constinit std::atomic<std::uint64_t> g_InternalAllocations{0};
-    constinit std::atomic<std::uint64_t> g_InternalAllocationBytes{0};
+    constinit std::atomic<std::int64_t> g_InternalAllocations{0};
+    constinit std::atomic<std::int64_t> g_InternalAllocationBytes{0};
 
-    constinit std::atomic<std::uint64_t> g_ExternalAllocations{0};
-    constinit std::atomic<std::uint64_t> g_ExternalAllocationBytes{0};
+    constinit std::atomic<std::int64_t> g_ExternalAllocations{0};
+    constinit std::atomic<std::int64_t> g_ExternalAllocationBytes{0};
 
     constinit std::atomic<bool> g_bTrackingEnabled{false};
 }
@@ -296,7 +296,7 @@ namespace AllocationTracking
 
     GlobalTracker::AllocSummaryInfo::AllocSummaryInfo(_In_ const MemoryInfo& info) noexcept
     {
-        m_TotalBytes += info.m_ByteCount;
+        m_TotalBytes += info.m_Bytes;
         ++m_TotalAllocations;
         m_OldestAllocation = (std::min)(m_OldestAllocation, info.m_Timestamp);
         m_NewestAllocation = (std::max)(m_NewestAllocation, info.m_Timestamp);
@@ -703,49 +703,13 @@ namespace AllocationTracking
 
     void GlobalTracker::TrackAllocation(_Inout_ MemoryInfo&& info)
     {
-        if (!!(info.m_OpFlagMask & OpFlag::Free))
+        if (!!(info.m_OpFlagMask & OpFlag::Free)) [[unlikely]]
         {
             __debugbreak();
         }
 
-        if (!!(info.m_OpFlagMask & OpFlag::Realloc) && (info.m_pMem == info.m_ReallocInfo.m_pOriginalMem))
-        {
-            if (info.m_pMem != info.m_ReallocInfo.m_pOriginalMem)
-            {
-                // Original memory was freed, but it's not clear to me if that comes through as
-                // a separate HeapFree call that we intercept, or if HeapReAlloc handles all of that internally.
-                // Call TrackDeallocation with a simulated MemoryInfo package for the original info.
-                auto CreateSimulatedReallocFree = [&info]()
-                {
-                    MemoryInfo tmp{
-                        .m_pMem = info.m_ReallocInfo.m_pOriginalMem,
-                        .m_ByteCount = info.m_ReallocInfo.m_OriginalBytes,
-                        .m_OpFlagMask = OpFlag::Free};
-                    tmp.m_Id = (info.m_Id - 1);
-                    return tmp;
-                };
-                TrackDeallocation(CreateSimulatedReallocFree());
-            }
-            else
-            {
-                // This was a realloc-in-place that expanded/shrunk the allocated memory.
-                if (info.m_ByteCount >= info.m_ReallocInfo.m_OriginalBytes)
-                {
-                    // Memory was expanded.
-                    g_ExternalAllocationBytes += (info.m_ByteCount - info.m_ReallocInfo.m_OriginalBytes);
-                }
-                else
-                {
-                    // Memory was shrunk.
-                    g_ExternalAllocationBytes -= (info.m_ReallocInfo.m_OriginalBytes - info.m_ByteCount);
-                }
-            }
-        }
-        else
-        {
-            g_ExternalAllocationBytes += info.m_ByteCount;
-            ++g_ExternalAllocations;
-        }
+        g_ExternalAllocationBytes += info.m_Bytes;
+        ++g_ExternalAllocations;
 
         using StdStackTraceT = StdStackTraceWithAllocatorT<SelfAllocator<std::stacktrace_entry>>;
         info.m_StackTrace = StdStackTraceT::current(1, s_cMaxStackTraceFrames);
@@ -755,12 +719,12 @@ namespace AllocationTracking
 
     void GlobalTracker::TrackDeallocation(_Inout_ MemoryInfo&& info)
     {
-        if (!(info.m_OpFlagMask & OpFlag::Free))
+        if (!(info.m_OpFlagMask & OpFlag::Free)) [[unlikely]]
         {
             __debugbreak();
         }
 
-        g_ExternalAllocationBytes -= info.m_ByteCount;
+        g_ExternalAllocationBytes -= info.m_Bytes;
         --g_ExternalAllocations;
 
         gtl_ThreadTracker.AddToQueue(std::move(info));
@@ -778,7 +742,7 @@ namespace AllocationTracking
     {
         if (waitForWorkerThreadLull)
         {
-            // Temporary lock grab to wait for WorkerThread to stop work.
+            // Temporary lock grab to wait for WorkerThread to finish in-progress batch of work.
             auto waitSpinScoped{m_WorkerThread.m_WorkerThreadInProgressLock.AcquireScoped()};
         }
         auto scopedLock{m_TrackerLock.AcquireScoped()};

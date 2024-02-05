@@ -4,9 +4,6 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 17.9.34414.90
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AllocationTracker", "AllocationTracker.vcxproj", "{536D8FE6-BE2A-497E-A561-2103F0190061}"
-	ProjectSection(ProjectDependencies) = postProject
-		{37489709-8054-4903-9C49-A79846049FC9} = {37489709-8054-4903-9C49-A79846049FC9}
-	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Testing", "..\Testing\Testing.vcxproj", "{79795591-6426-4678-A58C-6E6987FE0CBA}"
 	ProjectSection(ProjectDependencies) = postProject

@@ -222,6 +222,7 @@ namespace SLL
 #endif
 
     inline std::atomic<bool> g_bUseLocalTimeForFormattedLogMsg{true};
+    inline std::atomic<bool> g_bLocalTimeResourcesInitialized{false};
 
     class [[nodiscard]] FormattedLogMsg
     {
@@ -282,30 +283,40 @@ namespace SLL
 
             const auto currentTimeMs = []()
             {
+                const auto pCurrentZone = []() -> const std::chrono::time_zone*
+                {
+                    if (!g_bUseLocalTimeForFormattedLogMsg)
+                    {
+                        return nullptr;
+                    }
+                    if (g_bLocalTimeResourcesInitialized)
+                    {
+                        return std::chrono::current_zone();
+                    }
+
+                    g_bLocalTimeResourcesInitialized = true;
+
+                    try
+                    {
+                        return std::chrono::current_zone();
+                    }
+                    catch (const std::runtime_error&)
+                    {
+                        return nullptr;
+                    }
+                }();
+
                 const auto time{std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now())};
 
-                if (g_bUseLocalTimeForFormattedLogMsg)
+                if (!pCurrentZone)
                 {
-                    const auto pCurrentZone = std::chrono::current_zone();
-                    if (!pCurrentZone) [[unlikely]]
-                    {
-                        g_bUseLocalTimeForFormattedLogMsg = false;
-                    }
-                    else
-                    {
-                        try
-                        {
-                            return pCurrentZone->to_local(time);
-                        }
-                        catch (...)
-                        {
-                            g_bUseLocalTimeForFormattedLogMsg = false;
-                        }
-                    }
+                    // Well... darn.
+                    g_bUseLocalTimeForFormattedLogMsg = false;
+                    using LocalTimeMsT = decltype(std::chrono::current_zone()->to_local(time));
+                    return LocalTimeMsT{time.time_since_epoch()};
                 }
 
-                using LocalTimeMsT = decltype(std::chrono::current_zone()->to_local(time));
-                return LocalTimeMsT{time.time_since_epoch()};
+                return pCurrentZone->to_local(time);
             }();
 
             if (m_Buffer.empty())

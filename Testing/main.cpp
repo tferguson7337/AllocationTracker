@@ -1,121 +1,12 @@
 #include <AllocationTracker.h>
 #include <SimpleLoggingLibrary.h>
 
+#include <Windows.h>
+
+#include <map>
 #include <memory>
 #include <stacktrace>
 
-
-// C++ new/new[] operator overloads //
-
-#pragma warning(push)
-#pragma warning(disable: 28213) // The _Use_decl_annotations_ annotation must be used to reference, without modification, a prior declaration. No prior declaration found.
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new(
-    const std::size_t byteCount)
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::None, byteCount);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new(
-    const std::size_t byteCount,
-    const std::align_val_t alignment)
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::CustomAlignment, byteCount, alignment);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new(
-    const std::size_t byteCount,
-    const std::nothrow_t&) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::NoThrow, byteCount);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new(
-    const std::size_t byteCount,
-    const std::align_val_t alignment,
-    const std::nothrow_t&) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::NoThrow | Flag::CustomAlignment, byteCount, alignment);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new[](
-    const std::size_t byteCount)
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::Array, byteCount);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new[](
-    const std::size_t byteCount,
-    const std::align_val_t alignment)
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::Array | Flag::CustomAlignment, byteCount, alignment);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new[](
-    const std::size_t byteCount,
-    const std::nothrow_t&) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::Array | Flag::NoThrow, byteCount);
-}
-
-[[nodiscard]] _Use_decl_annotations_
-void* operator new[](
-    const std::size_t byteCount,
-    const std::align_val_t alignment,
-    const std::nothrow_t&) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformAllocation(Flag::Array | Flag::NoThrow | Flag::CustomAlignment, byteCount, alignment);
-}
-
-
-// C++ delete/delete[] operator overloads //
-
-void operator delete(
-    void* pMem) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformDeallocation(Flag::NoThrow, pMem);
-}
-
-void operator delete(
-    void* pMem,
-    [[maybe_unused]] const std::align_val_t alignment) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformDeallocation(Flag::NoThrow | Flag::CustomAlignment, pMem);
-}
-
-void operator delete[](
-    void* pMem) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformDeallocation(Flag::Array | Flag::NoThrow, pMem);
-}
-
-void operator delete[](
-    void* pMem,
-    [[maybe_unused]] const std::align_val_t alignment) noexcept
-{
-    using Flag = AllocationTracking::AllocFlag;
-    return AllocationTracking::PerformDeallocation(Flag::Array | Flag::NoThrow | Flag::CustomAlignment, pMem);
-}
-
-#pragma warning(pop)
 
 std::filesystem::path BuildLoggerPath(_In_opt_z_ const char* pFilePath)
 {
@@ -137,29 +28,26 @@ std::vector<std::uint8_t> CreateDynamicBuffer(_In_ const std::size_t reserveByte
 }
 
 
-auto g_pStdOutLogger{SLL::Factory<SLL::SyncLogger<SLL::StdOutLogger>>{}()};
+auto g_pStdOutLogger{SLL::UniqueFactory<SLL::SyncLogger<SLL::StdOutLogger>>{}()};
+decltype(SLL::Factory<SLL::DispatchLogger>{}()) g_pDispatchLogger;
 
-auto GenerateLogger()
+void GenerateLoggers()
 {
+    if (!!g_pDispatchLogger.Get())
+    {
+        return;
+    }
+
     using namespace std::literals::string_view_literals;
     static constexpr auto s_cFileLoggerPath{LR"(C:\users\tferg\desktop\AllocationTrackingLog.txt)"sv};
     std::filesystem::remove(s_cFileLoggerPath);
 
-    auto pDispatchLogger = SLL::Factory<SLL::DispatchLogger>{}();
-
-    const bool bRegistrationSuccessful =
-        pDispatchLogger->RegisterLoggers(
-            g_pStdOutLogger,
-            SLL::Factory<SLL::FileLogger>{}(s_cFileLoggerPath));
-    if (!bRegistrationSuccessful)
-    {
-        SLL::StdErrLogger{}("Failed to register loggers");
-    }
-
-    return pDispatchLogger;
+    g_pDispatchLogger = SLL::Factory<SLL::DispatchLogger>{}(
+        g_pStdOutLogger,
+        SLL::Factory<SLL::FileLogger>{}(s_cFileLoggerPath));
 }
 
-static constexpr std::size_t s_cTestBuffersArrayLength{64};
+static constexpr std::size_t s_cTestBuffersArrayLength{128};
 using TestBuffers = std::vector<std::vector<std::uint8_t>>;
 using TestBuffersArray = std::array<TestBuffers, s_cTestBuffersArrayLength>;
 std::unique_ptr<TestBuffersArray> g_pTestBuffers;
@@ -197,6 +85,9 @@ void AllocateForTestBuffer(_In_ const std::size_t idx)
     }
     Duration totalCreationDur{Clock::now() - totalT0};
 
+    buffers.clear();
+
+    /**
     g_pStdOutLogger->Log("Thread[{}]\n  TotalCreations[{}]\n  Min Creation Dur[{}]\n  Max Creation Dur[{}]\n  TotalCreationDur[{}]\n  Avg Creation Dur[{}]\n\n",
         std::this_thread::get_id(),
         s_cOuterLoopAmount * s_cInnerLoopAmount,
@@ -204,72 +95,100 @@ void AllocateForTestBuffer(_In_ const std::size_t idx)
         std::chrono::duration_cast<std::chrono::microseconds>(maxCreationDur),
         std::chrono::duration_cast<std::chrono::milliseconds>(totalCreationDur),
         std::chrono::duration_cast<std::chrono::microseconds>(totalCreationDur / (s_cOuterLoopAmount * s_cInnerLoopAmount)));
+    /**/
 }
 
-void LogAllocs(_Inout_ SLL::ValidLoggerType auto& logger)
+void LogAllocs()
 {
-    auto LogCallback = [&logger](_In_ const std::string_view logMsgSV) mutable
+    if (!g_pDispatchLogger.Get())
     {
-        logger.Log("{}", logMsgSV);
-    };
-
-    AllocationTracking::LogAllocations(LogCallback, AllocationTracking::LogSummaryType::FullStackTraces, true);
-}
-
-int main(
-    [[maybe_unused]] _In_ const int argc,
-    [[maybe_unused]] _In_count_(argc) const char* argv[])
-{
-    AllocationTracking::ScopedTrackerInit at_sti_;
-    AllocationTracking::CollectFullStackTraces(true);
-    AllocationTracking::RegisterExternalStackEntryMarker("!SLL::Factory");
-    AllocationTracking::RegisterExternalStackEntryMarker("!GenerateLogger");
-
-    g_pStdOutLogger->Log("Testing AllocationTracking");
-    {
-        AllocationTracking::ScopedThreadLocalTrackingDisabler at_stltd_;
-        g_pStdOutLogger->Log("Reference StackTrace:\n{}", std::stacktrace::current());
+        return;
     }
 
-    auto pLogger = GenerateLogger();
+    auto LogCallback = [](_In_ const std::string_view logMsgSV) mutable
+    {
+        g_pDispatchLogger->Log("{}", logMsgSV);
+    };
 
-    LogAllocs(*pLogger);
+    AllocationTracking::LogAllocations(LogCallback, AllocationTracking::LogSummaryType::Normal, true);
+}
+
+
+void RunTrackerTests()
+{
+    // LogAllocs();
     {
         g_pTestBuffers = std::make_unique<TestBuffersArray>();
-        LogAllocs(*pLogger);
+        // LogAllocs();
 
         {
             const auto allocT0{std::chrono::steady_clock::now()};
             std::ranges::generate(std::array<std::jthread, s_cTestBuffersArrayLength>{},
                 [idx = std::size_t{0}]() mutable { return std::jthread{AllocateForTestBuffer, idx++}; });
-            const auto allocT1{std::chrono::steady_clock::now()};
-            g_pStdOutLogger->Log("Test Buffer Alloc Duration[{}]",
-                std::chrono::duration_cast<std::chrono::milliseconds>(allocT1 - allocT0));
+            const auto dur{std::chrono::steady_clock::now() - allocT0};
+            g_pStdOutLogger->Log("Test Buffer Alloc Duration[{}]", std::chrono::duration_cast<std::chrono::milliseconds>(dur));
         }
 
-        LogAllocs(*pLogger);
+        // LogAllocs();
 
         {
             const auto freeT0{std::chrono::steady_clock::now()};
             g_pTestBuffers.reset();
             const auto freeT1{std::chrono::steady_clock::now()};
-            g_pStdOutLogger->Log("Test Buffer Free Duration[{}]",
-                std::chrono::duration_cast<std::chrono::milliseconds>(freeT1 - freeT0));
+            g_pStdOutLogger->Log("Test Buffer Free Duration[{}]", std::chrono::duration_cast<std::chrono::milliseconds>(freeT1 - freeT0));
         }
     }
-    LogAllocs(*pLogger);
+    // LogAllocs();
     {
         static constexpr std::size_t s_cElems = (1 << 30);
         auto ptr = std::make_unique<std::uint32_t[]>(s_cElems);
         if (!!ptr) { std::fill(&ptr[0], &ptr[s_cElems], 0); }
-        LogAllocs(*pLogger);
+        // LogAllocs();
     }
 
-    for (auto i = 0u; i < 10u; ++i)
+    for (auto i = 0u; i < 2u; ++i)
     {
-        LogAllocs(*pLogger);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // LogAllocs();
+        // std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    LogAllocs(*pLogger);
+    // LogAllocs();
+}
+
+static void EnableTracking(_In_ const bool bEnable)
+{
+    if (!bEnable)
+    {
+        AllocationTracking::EnableTracking(true);
+        return;
+    }
+
+    AllocationTracking::SetTargetModuleNamePrefix("Testing!");
+    AllocationTracking::RegisterExternalStackEntryMarker("!SLL::Factory");
+    AllocationTracking::RegisterExternalStackEntryMarker("!GenerateLogger");
+    AllocationTracking::SetCollectFullStackTraces(true);
+    AllocationTracking::EnableTracking(true);
+}
+
+static volatile bool g_bReadyForExit{false};
+
+int main(
+    [[maybe_unused]] _In_ const int argc,
+    [[maybe_unused]] _In_count_(argc) const char* argv[])
+{
+    EnableTracking(true);
+
+    GenerateLoggers();
+    g_pStdOutLogger->Log("Testing AllocationTracking");
+
+    do
+    {
+        RunTrackerTests();
+    } while (!g_bReadyForExit);
+
+    g_bReadyForExit = false;
+    do
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    } while (!g_bReadyForExit);
 }

@@ -18,6 +18,9 @@
     <ClCompile Include="AllocationTracker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DLLMain.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AllocationTracker.h">
@@ -26,5 +29,14 @@
     <ClInclude Include="StringUtils.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="AllocationTrackerInternal.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="EnumOps.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Natvis Include="AllocationTracking.natvis" />
   </ItemGroup>
 </Project>

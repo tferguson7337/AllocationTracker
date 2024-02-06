@@ -300,6 +300,9 @@ namespace AllocationTracking
 // GlobalTracker
 namespace AllocationTracking
 {
+    std::shared_ptr<GlobalTracker> GlobalTracker::s_pTracker{nullptr};
+
+
     [[nodiscard]] auto SystemClockTimestampToLocalTime(_In_ const std::chrono::system_clock::time_point timestamp)
         -> decltype(std::chrono::current_zone()->to_local(timestamp))
     {
@@ -833,63 +836,55 @@ namespace AllocationTracking
 }
 
 
-namespace AllocationTracking
+void AllocationTracker_LogAllocations(
+    _In_ const AllocationTracking::LogCallback& logFn,
+    _In_ const AllocationTracking::LogSummaryType type)
 {
-    void LogAllocations(
-        _In_ const LogCallback& logFn,
-        _In_ const LogSummaryType type)
+    const auto pTracker = AllocationTracking::GlobalTracker::Instance();
+    if (!!pTracker)
     {
-        const auto pTracker = GlobalTracker::Instance();
-        if (!!pTracker)
-        {
-            pTracker->LogSummary(logFn, type);
-        }
+        pTracker->LogSummary(logFn, type);
     }
 }
 
 
-namespace AllocationTracking
+void AllocationTracker_EnableTracking(_In_ const bool bEnabled)
 {
-    void EnableTracking(_In_ const bool bEnabled)
-    {
-        g_bTrackingEnabled = bEnabled;
-    }
+    AllocationTracking::g_bTrackingEnabled = bEnabled;
+}
 
-    void SetTargetModuleNamePrefix(_In_ const std::string_view prefixSV)
+void AllocationTracker_SetTargetModuleNamePrefix(_In_ const std::string_view prefixSV)
+{
+    auto pTracker = AllocationTracking::GlobalTracker::Instance();
+    if (!!pTracker)
     {
-        auto pTracker = GlobalTracker::Instance();
-        if (!!pTracker)
-        {
-            pTracker->SetTargetModuleNamePrefix(prefixSV);
-        }
-    }
-
-    void RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV)
-    {
-        auto pTracker = GlobalTracker::Instance();
-        if (!!pTracker)
-        {
-            pTracker->AddExternalStackEntryMarker(markerSV);
-        }
-    }
-
-    void RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
-    {
-        auto pTracker = GlobalTracker::Instance();
-        if (!!pTracker)
-        {
-            pTracker->AddExternalStackEntryMarkers(markers);
-        }
-    }
-
-    void SetCollectFullStackTraces(_In_ const bool bCollect)
-    {
-        auto pTracker = GlobalTracker::Instance();
-        if (!!pTracker)
-        {
-            pTracker->SetCollectFullStackTraces(bCollect);
-        }
+        pTracker->SetTargetModuleNamePrefix(prefixSV);
     }
 }
 
-std::shared_ptr<AllocationTracking::GlobalTracker> AllocationTracking::GlobalTracker::s_pTracker{nullptr};
+void AllocationTracker_RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV)
+{
+    auto pTracker = AllocationTracking::GlobalTracker::Instance();
+    if (!!pTracker)
+    {
+        pTracker->AddExternalStackEntryMarker(markerSV);
+    }
+}
+
+void AllocationTracker_RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers)
+{
+    auto pTracker = AllocationTracking::GlobalTracker::Instance();
+    if (!!pTracker)
+    {
+        pTracker->AddExternalStackEntryMarkers(markers);
+    }
+}
+
+void AllocationTracker_SetCollectFullStackTraces(_In_ const bool bCollect)
+{
+    auto pTracker = AllocationTracking::GlobalTracker::Instance();
+    if (!!pTracker)
+    {
+        pTracker->SetCollectFullStackTraces(bCollect);
+    }
+}

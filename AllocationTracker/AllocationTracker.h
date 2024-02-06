@@ -24,20 +24,37 @@ namespace AllocationTracking
         FullStackTraces
     };
 
-    ALLOCTRACKER_DECLSPEC_DLL void LogAllocations(
+    using LogAllocationsFn = void(*)(
         _In_ const LogCallback& logFn,
         _In_ const LogSummaryType type);
+
+    using EnableTracking = void(*)(
+        _In_ const bool bEnabled);
+
+    using SetTargetModuleNamePrefix = void(*)(
+        _In_ const std::string_view prefixSV);
+
+    using RegisterExternalStackEntryMarker = void(*)(
+        _In_ const std::string_view markerSV);
+
+    using RegisterExternalStackEntryMarkers = void(*)(
+        _In_ const std::vector<std::string_view>& markers);
+
+    using SetCollectFullStackTraces = void(*)(
+        _In_ const bool bCollect);
 }
 
-
-namespace AllocationTracking
+extern "C"
 {
-    ALLOCTRACKER_DECLSPEC_DLL void EnableTracking(_In_ const bool bEnabled);
+    ALLOCTRACKER_DECLSPEC_DLL void AllocationTracker_LogAllocations(
+        _In_ const AllocationTracking::LogCallback& logFn,
+        _In_ const AllocationTracking::LogSummaryType type);
 
-    // E.g., "MyExecutable!"
-    ALLOCTRACKER_DECLSPEC_DLL void SetTargetModuleNamePrefix(_In_ const std::string_view prefixSV);
-    ALLOCTRACKER_DECLSPEC_DLL void RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV);
-    ALLOCTRACKER_DECLSPEC_DLL void RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers);
+    ALLOCTRACKER_DECLSPEC_DLL void AllocationTracker_EnableTracking(_In_ const bool bEnabled);
 
-    ALLOCTRACKER_DECLSPEC_DLL void SetCollectFullStackTraces(_In_ const bool bCollect);
+    ALLOCTRACKER_DECLSPEC_DLL void AllocationTracker_SetTargetModuleNamePrefix(_In_ const std::string_view prefixSV);
+    ALLOCTRACKER_DECLSPEC_DLL void AllocationTracker_RegisterExternalStackEntryMarker(_In_ const std::string_view markerSV);
+    ALLOCTRACKER_DECLSPEC_DLL void AllocationTracker_RegisterExternalStackEntryMarkers(_In_ const std::vector<std::string_view>& markers);
+
+    ALLOCTRACKER_DECLSPEC_DLL void AllocationTracker_SetCollectFullStackTraces(_In_ const bool bCollect);
 }

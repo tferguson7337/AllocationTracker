@@ -110,7 +110,8 @@ void LogAllocs()
         g_pDispatchLogger->Log("{}", logMsgSV);
     };
 
-    AllocationTracking::LogAllocations(LogCallback, AllocationTracking::LogSummaryType::Normal, true);
+    static constexpr auto s_cLogType{AllocationTracking::LogSummaryType::FullStackTraces};
+    AllocationTracking::LogAllocations(LogCallback, s_cLogType);
 }
 
 
@@ -142,17 +143,17 @@ void RunTrackerTests()
     {
         static constexpr std::size_t s_cElems = (1 << 30);
         auto ptr = std::make_unique<std::uint32_t[]>(s_cElems);
-        if (!!ptr) { std::fill(&ptr[0], &ptr[s_cElems], 0); }
+        if (!!ptr) { std::fill(&ptr[0], &ptr[s_cElems], 0); } // Touch the memory so it gets committed.
         // LogAllocs();
     }
 
-    for (auto i = 0u; i < 2u; ++i)
+    for (auto i = 0u; i < 10u; ++i)
     {
         // LogAllocs();
-        // std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    // LogAllocs();
+    LogAllocs();
 }
 
 static void EnableTracking(_In_ const bool bEnable)
@@ -170,7 +171,7 @@ static void EnableTracking(_In_ const bool bEnable)
     AllocationTracking::EnableTracking(true);
 }
 
-static volatile bool g_bReadyForExit{false};
+static volatile bool g_bReadyForExit{true};
 
 int main(
     [[maybe_unused]] _In_ const int argc,
@@ -186,7 +187,7 @@ int main(
         RunTrackerTests();
     } while (!g_bReadyForExit);
 
-    g_bReadyForExit = false;
+    g_bReadyForExit = true;
     do
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));

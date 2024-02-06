@@ -18,6 +18,7 @@
 #include <stacktrace>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "StringUtils.h"
 
@@ -186,6 +187,7 @@ namespace AllocationTracking
             {
                 return lhs.m_Id < rhs.m_Id;
             };
+            toMerge.sort(SortById); // !?!?!?
             merged.merge(toMerge, SortById);
         });
 
@@ -196,7 +198,6 @@ namespace AllocationTracking
     {
         while (WaitForWork())
         {
-            auto scopedWorkInProgressSL{m_WorkerThreadInProgressLock.AcquireScoped()};
             auto pTracker{GlobalTracker::InstanceIfTrackingEnabled()};
             if (!pTracker)
             {
@@ -296,84 +297,297 @@ namespace AllocationTracking
     }
 }
 
-
-// GlobalTracker::AllocSummaryInfo
-namespace AllocationTracking
-{
-    GlobalTracker::AllocSummaryInfo::AllocSummaryInfo() noexcept = default;
-
-    GlobalTracker::AllocSummaryInfo::AllocSummaryInfo(_In_ const MemoryInfo& info) noexcept
-    {
-        m_TotalBytes += info.m_Bytes;
-        ++m_TotalAllocations;
-        m_OldestAllocation = (std::min)(m_OldestAllocation, info.m_Timestamp);
-        m_NewestAllocation = (std::max)(m_NewestAllocation, info.m_Timestamp);
-    }
-
-    GlobalTracker::AllocSummaryInfo& GlobalTracker::AllocSummaryInfo::operator<<(
-        _In_ const GlobalTracker::AllocSummaryInfo& other) noexcept
-    {
-        m_TotalBytes += other.m_TotalBytes;
-        m_TotalAllocations += other.m_TotalAllocations;
-        m_OldestAllocation = (std::min)(m_OldestAllocation, other.m_OldestAllocation);
-        m_NewestAllocation = (std::max)(m_NewestAllocation, other.m_NewestAllocation);
-
-        return *this;
-    }
-}
-
-
 // GlobalTracker
 namespace AllocationTracking
 {
-    [[nodiscard]] static std::string FormatAllocationSummaryInfo(_In_ const auto pairView)
+    [[nodiscard]] auto SystemClockTimestampToLocalTime(_In_ const std::chrono::system_clock::time_point timestamp)
+        -> decltype(std::chrono::current_zone()->to_local(timestamp))
+    {
+        try
+        {
+            const auto pCurrentZone{std::chrono::current_zone()};
+            if (!!pCurrentZone)
+            {
+                return std::chrono::current_zone()->to_local(timestamp);
+            }
+        }
+        catch (...)
+        {
+            // Nothing to do...
+        }
+
+        return {};
+    }
+
+    [[nodiscard]] static std::string FormatSTEAllocationSummaryInfoPair(_In_ const auto steAllocSummaryInfoPair)
     {
         using namespace StringUtils::Fmt;
+        using FmtByte = Memory::Fixed::Byte<>;
         using FmtByteUpToMebibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Mebibyte>;
         using FmtDec = Numeric::Dec<>;
 
-        auto TimestampToLocalTime = [](const auto timestamp) -> decltype(std::chrono::current_zone()->to_local(timestamp))
-        {
-            try
-            {
-                const auto pCurrentZone{std::chrono::current_zone()};
-                if (!!pCurrentZone)
-                {
-                    return std::chrono::current_zone()->to_local(timestamp);
-                }
-            }
-            catch (...)
-            {
-                // Nothing to do...
-            }
-
-            return {};
-        };
-
-        static constexpr auto s_cSummaryInfoFormatStr = R"Fmt(
+        static constexpr auto s_cSTESummaryInfoFormatStr = R"Fmt(
 
   Location
     Function[{0:}]
     File[{1:}@{2:}]
-  Allocations[{3:} : {4:}]
-  Oldest[{5:%m}/{5:%d}/{5:%Y} {5:%T}]
-  Newest[{6:%m}/{6:%d}/{6:%Y} {6:%T}]
+  Allocations[{3:} : {4:} ({5:})]
+  Oldest[{6:%m}/{6:%d}/{6:%Y} {6:%T}]
+  Newest[{7:%m}/{7:%d}/{7:%Y} {7:%T}]
 )Fmt";
-        const auto& [stackTraceEntry, allocSummaryInfo] = *pairView;
+        const auto& [pStackTraceEntry, pAllocSummaryInfo] = steAllocSummaryInfoPair;
         return std::format(
-            s_cSummaryInfoFormatStr,
-            stackTraceEntry.description(),
-            stackTraceEntry.source_file(), FmtDec{}(stackTraceEntry.source_line()),
-            FmtDec{}(allocSummaryInfo.m_TotalAllocations), FmtByteUpToMebibyte{}(allocSummaryInfo.m_TotalBytes),
-            TimestampToLocalTime(allocSummaryInfo.m_OldestAllocation),
-            TimestampToLocalTime(allocSummaryInfo.m_NewestAllocation));
+            s_cSTESummaryInfoFormatStr,
+            pStackTraceEntry->description(),
+            pStackTraceEntry->source_file(), FmtDec{}(pStackTraceEntry->source_line()),
+            FmtDec{}(pAllocSummaryInfo->m_TotalAllocations), FmtByteUpToMebibyte{}(pAllocSummaryInfo->m_TotalBytes), FmtByte{}(pAllocSummaryInfo->m_TotalBytes),
+            SystemClockTimestampToLocalTime(pAllocSummaryInfo->m_OldestAllocation),
+            SystemClockTimestampToLocalTime(pAllocSummaryInfo->m_NewestAllocation));
     }
 
-    // Logs each unique alloc-stacktrace, with total bytes each trace has allocated.
-    // Also logs total allocations, total bytes overall, and tracking overhead bytes.
-    void GlobalTracker::LogSummaryUnsafe(
-        _In_ const LogCallback& logFn,
-        _In_ const LogSummaryType type) const
+    [[nodiscard]] static std::string FormatFullStackTraceAllocationSummaryInfoPair(_In_ const auto fullStackTraceAllocSummaryInfoPair)
+    {
+        using namespace StringUtils::Fmt;
+        using FmtByte = Memory::Fixed::Byte<>;
+        using FmtByteUpToMebibyte = Memory::AutoConverting::Byte<Memory::UnitTags::Mebibyte>;
+        using FmtDec = Numeric::Dec<>;
+
+        static constexpr auto s_cFullStackSummaryInfoFormatStr = R"Fmt(
+
+  Stack
+{0:}
+
+  Allocations[{1:} : {2:} ({3:})]
+  Oldest[{4:%m}/{4:%d}/{4:%Y} {4:%T}]
+  Newest[{5:%m}/{5:%d}/{5:%Y} {5:%T}]
+)Fmt";
+        const auto& [pFullStackTrace, pAllocSummaryInfo] = fullStackTraceAllocSummaryInfoPair;
+        return std::format(
+            s_cFullStackSummaryInfoFormatStr,
+            *pFullStackTrace,
+            FmtDec{}(pAllocSummaryInfo->m_TotalAllocations), FmtByteUpToMebibyte{}(pAllocSummaryInfo->m_TotalBytes), FmtByte{}(pAllocSummaryInfo->m_TotalBytes),
+            SystemClockTimestampToLocalTime(pAllocSummaryInfo->m_OldestAllocation),
+            SystemClockTimestampToLocalTime(pAllocSummaryInfo->m_NewestAllocation));
+    }
+
+    //
+    // Returns true if `entry` does not come from something "internal", e.g.:
+    //  - `std` namespace
+    //  - AllocationTracking namespace.
+    //  - Contains a string that was added via `RegisterExternalStackEntryMarker`.
+    //  - Allocation related (e.g,, operator new, malloc, etc.).
+    //  - If TargetModuleNamePrefix has been set, must match beginning of STE description (e.g., "MyProgram.exe!").
+    //      - Helps exclude calls internal to DLLs.
+    //
+    //  Note, this is not comprehensive.
+    //
+    [[nodiscard]] static bool IsUserStackTraceEntry(
+        _In_ const LogInformationPackage& infoPkg,
+        _In_ const std::stacktrace_entry& entry)
+    {
+        // TODO: Settle on a better naming schema than internal or external.
+        //      Perhaps "NonBucketable"? ...ugh.
+        using namespace std::literals::string_view_literals;
+
+        static constexpr std::array s_cMSVCInternalSourceFileMarkers
+        {
+            // Filter out common MSVC related source file paths.
+            "minkernel\\crts\\"sv,
+            "\\Microsoft Visual Studio\\"sv,
+            "\\src\\vctools\\crt\\"sv,
+        };
+
+        const std::string sourcePath{entry.source_file()};
+        auto SourcePathContainsMarker =
+            [sv = std::string_view{sourcePath}](_In_ const std::string_view marker) { return sv.contains(marker); };
+
+        if (std::ranges::any_of(s_cMSVCInternalSourceFileMarkers, SourcePathContainsMarker))
+        {
+            return false;
+        }
+
+        static constexpr std::array s_cInternalStackTraceEntryMarkers
+        {
+            // Don't bucket functions that have description beginning with backtick or underscore.
+            // These are typically lambdas, or MSVC internal functions.
+            "!`"sv,
+            "!_"sv,
+            "!<"sv,
+
+            "!std::"sv,
+            "!AllocationTracking::"sv,
+            "!operator new"sv,
+            "!malloc"sv,
+            "!calloc"sv,
+            "!realloc"sv,
+        };
+
+        const std::string desc{entry.description()};
+        auto DescriptionContainsMarker =
+            [sv = std::string_view{desc}](_In_ const std::string_view marker) { return sv.contains(marker); };
+
+        if (std::ranges::any_of(s_cInternalStackTraceEntryMarkers, DescriptionContainsMarker))
+        {
+            return false;
+        }
+
+        if (std::ranges::any_of(infoPkg.m_ExternalUserStackTraceEntryMarkers, DescriptionContainsMarker))
+        {
+            return false;
+        }
+
+        if (infoPkg.m_TargetModuleNamePrefix.empty())
+        {
+            // If we don't have a target module name, assume this is good.
+            return true;
+        }
+
+        return desc.starts_with(infoPkg.m_TargetModuleNamePrefix);
+    }
+
+    [[nodiscard]] static std::stacktrace_entry FindFirstUserStackTraceEntryByDescription(
+        _In_ const LogInformationPackage& infoPkg,
+        _In_ const MemoryInfo& info)
+    {
+        const auto stSpan{info.m_StackTrace.ToSpan()};
+        const auto itr{std::ranges::find_if(stSpan,
+            [&infoPkg](const auto entry) { return IsUserStackTraceEntry(infoPkg, entry); })};
+        return (itr == stSpan.cend()) ? stSpan.front() : *itr;
+    }
+
+    template <LogSummaryType Type>
+    static auto GenerateStackTraceEntryBucketedMapOfMemoryInfoPtrSets(
+        _In_ const LogInformationPackage& infoPkg)
+    {
+        using MemoryInfoPtr = const MemoryInfo*;
+        struct MemoryInfoPtrGreater
+        {
+            [[nodiscard]] constexpr bool operator()(
+                _In_ const MemoryInfoPtr pLhs,
+                _In_ const MemoryInfoPtr pRhs) const noexcept
+            {
+                // Sort by '> bytes' to prioritize larger allocs.
+                return pLhs->m_Bytes > pRhs->m_Bytes;
+            }
+        };
+
+        struct AllocSummaryInfo
+        {
+            std::size_t m_TotalBytes{0};
+            std::size_t m_TotalAllocations{0};
+
+            MemoryInfo::TimePoint m_OldestAllocation{(MemoryInfo::TimePoint::max)()};
+            MemoryInfo::TimePoint m_NewestAllocation{(MemoryInfo::TimePoint::min)()};
+
+            AllocSummaryInfo() noexcept = default;
+            AllocSummaryInfo(_In_ const MemoryInfo& info) noexcept
+            {
+                m_TotalBytes += info.m_Bytes;
+                ++m_TotalAllocations;
+                m_OldestAllocation = (std::min)(m_OldestAllocation, info.m_Timestamp);
+                m_NewestAllocation = (std::max)(m_NewestAllocation, info.m_Timestamp);
+            }
+
+            AllocSummaryInfo& operator<<(_In_ const AllocSummaryInfo& other) noexcept
+            {
+                m_TotalBytes += other.m_TotalBytes;
+                m_TotalAllocations += other.m_TotalAllocations;
+                m_OldestAllocation = (std::min)(m_OldestAllocation, other.m_OldestAllocation);
+                m_NewestAllocation = (std::max)(m_NewestAllocation, other.m_NewestAllocation);
+
+                return *this;
+            }
+        };
+
+        using FullStackTracePtr = const StackTraceEntryArray*;
+        struct FullStackTracePtrLess
+        {
+            [[nodiscard]] constexpr bool operator()(
+                _In_ const FullStackTracePtr pLhs,
+                _In_ const FullStackTracePtr pRhs) const noexcept
+            {
+                return *pLhs < *pRhs;
+            }
+        };
+
+        using FullStackTracePtrToAllocSummaryMapPair = std::pair<const FullStackTracePtr, AllocSummaryInfo>;
+        using FullStackTracePtrToAllocSummaryMap = std::map<
+            FullStackTracePtr,
+            AllocSummaryInfo,
+            FullStackTracePtrLess,
+            SelfAllocator<FullStackTracePtrToAllocSummaryMapPair>>;
+
+        using FullStackTracePtrToAllocSummaryMapPairVector = 
+            std::vector<FullStackTracePtrToAllocSummaryMapPair, SelfAllocator<FullStackTracePtrToAllocSummaryMapPair>>;
+
+        struct [[nodiscard]] STEBucketInfo
+        {
+            AllocSummaryInfo m_OverallSummaryInfo;
+            FullStackTracePtrToAllocSummaryMap m_FullStackTracePtrToAllocSummaryMap;
+
+            [[nodiscard]] auto GetFullStackTracesSortedByBytesDescending() const
+            {
+                using ElemT = std::pair<
+                    std::remove_const_t<typename FullStackTracePtrToAllocSummaryMapPair::first_type>,
+                    typename FullStackTracePtrToAllocSummaryMapPair::second_type>;
+                std::vector<ElemT, SelfAllocator<ElemT>> ret{
+                    m_FullStackTracePtrToAllocSummaryMap.cbegin(),
+                    m_FullStackTracePtrToAllocSummaryMap.cend()};
+
+                auto SortByAllocSummaryBytes = [](
+                    const FullStackTracePtrToAllocSummaryMapPair& lhs,
+                    const FullStackTracePtrToAllocSummaryMapPair& rhs)
+                {
+                    return lhs.second.m_TotalBytes > rhs.second.m_TotalBytes;
+                };
+
+                std::ranges::sort(ret, SortByAllocSummaryBytes);
+
+                return ret;
+            }
+        };
+
+        using MapKey = std::stacktrace_entry;
+        using MapValue = STEBucketInfo;
+        using StackTraceEntryToMemoryInfoSetMap = std::unordered_map<
+            MapKey,
+            MapValue,
+            std::hash<MapKey>,
+            std::equal_to<MapKey>,
+            SelfAllocator<std::pair<const MapKey, MapValue>>>;
+
+        StackTraceEntryToMemoryInfoSetMap buckets;
+        for (const MemoryInfo& info : infoPkg.m_MemoryInfoSet)
+        {
+            auto& [overallSummaryInfo, fullStackToAllocSummaryMap] = buckets[FindFirstUserStackTraceEntryByDescription(infoPkg, info)];
+            overallSummaryInfo << info;
+
+            if constexpr (Type == LogSummaryType::FullStackTraces)
+            {
+                [[maybe_unused]] const auto [fullStackMapItr, bFSTASMEmplaced] {fullStackToAllocSummaryMap.emplace(&info.m_StackTrace, AllocSummaryInfo{})};
+                fullStackMapItr->second << info;
+            }
+        }
+
+        // Now that it's all bucketed, put each bucket in a vector and sort by overall bytes alloc'd, descending.
+        using STEBucket = std::stacktrace_entry;
+        using BucketValue = STEBucketInfo;
+        using BucketPair = std::pair<STEBucket, BucketValue>;
+        std::vector<BucketPair, SelfAllocator<BucketPair>> ret{buckets.begin(), buckets.end()};
+        
+        auto SortByBucketAllocBytesDescending = [](_In_ const BucketPair& lhs, _In_ const BucketPair& rhs)
+        {
+            return lhs.second.m_OverallSummaryInfo.m_TotalBytes > rhs.second.m_OverallSummaryInfo.m_TotalBytes;
+        };
+        std::ranges::sort(ret, SortByBucketAllocBytesDescending);
+
+        return ret;
+    }
+
+    template <LogSummaryType Type>
+    static void LogSummaryImpl(
+        _In_ LogInformationPackage infoPkg,
+        _In_ const LogCallback& logFn)
     {
         using namespace std::literals::string_view_literals;
 
@@ -382,102 +596,30 @@ namespace AllocationTracking
         using FmtByte = Memory::Fixed::Byte<>;
         using FmtDec = Numeric::Dec<>;
 
-        AllocSummaryInfo overallAllocSummaryInfo;
-        auto CountMetrics = [&overallAllocSummaryInfo](const std::pair<const std::stacktrace_entry, MemoryInfoSet>& pair)
-        {
-            const AllocSummaryInfo newInfo = [&set = pair.second]()
-            {
-                AllocSummaryInfo asi;
-                for (const auto& memInfo : set) { asi << memInfo; }
-                return asi;
-            }();
-            overallAllocSummaryInfo << newInfo;
-            return newInfo;
-        };
-
         using LogLines = std::basic_string<char, std::char_traits<char>, NonTrackingAllocator<char>>;
         LogLines logLines;
 
-        if (type != LogSummaryType::Limited)
+        if constexpr (Type != LogSummaryType::Limited)
         {
-            using MapKey = std::stacktrace_entry;
-            using MapValue = AllocSummaryInfo;
-            using MapPair = std::pair<const MapKey, MapValue>;
-            using Map = std::map<MapKey, MapValue, std::less<MapKey>, NonTrackingAllocator<MapPair>>;
-            Map steToTotalAllocMap;
-
-            auto CountMetricsAndBuildMap = [&CountMetrics, &steToTotalAllocMap, type, this](const auto& pair)
+            const auto sortedAllocationInfoGroupByCommonStackTraceEntries{GenerateStackTraceEntryBucketedMapOfMemoryInfoPtrSets<Type>(infoPkg)};
+            for (const auto& [steBucket, bucketInfo] : sortedAllocationInfoGroupByCommonStackTraceEntries)
             {
-                const auto& [steKey, allocPackageSet] {pair};
-                if (pair.second.empty())
-                {
-                    return;
-                }
-
-                auto& summaryInfo = steToTotalAllocMap[pair.first];
-                summaryInfo << CountMetrics(pair);
-                if (type == LogSummaryType::FullStackTraces)
-                {
-                    for (const auto& allocPkg : allocPackageSet)
-                    {
-                        summaryInfo.m_FullStackTraces.insert(&allocPkg.m_StackTrace);
-                    }
-                }
-            };
-            std::ranges::for_each(m_StackTraceEntryToMemoryInfoSetMap, CountMetricsAndBuildMap);
-
-            struct MapPairView
-            {
-                const MapPair* m_pView{nullptr};
-
-                constexpr MapPairView() noexcept = default;
-
-                constexpr MapPairView(_In_ const MapPair& mapPair) noexcept :
-                    m_pView{std::addressof(mapPair)}
-                { }
-
-                [[nodiscard]] bool operator>(_In_ const MapPairView other) const noexcept
-                {
-                    return m_pView->second.m_TotalBytes > other.m_pView->second.m_TotalBytes;
-                }
-
-                const MapPair& operator*() const noexcept
-                {
-                    return *m_pView;
-                }
-
-                const MapPair* operator->() const noexcept
-                {
-                    return m_pView;
-                }
-            };
-
-            const auto sortedSummaryAllocViews = [&steToTotalAllocMap]()
-            {
-                std::vector<MapPairView, NonTrackingAllocator<MapPairView>> vec{steToTotalAllocMap.size()};
-                std::ranges::copy(steToTotalAllocMap, vec.begin());
-                std::ranges::sort(vec, std::greater<>{});
-                return vec;
-            }();
-            for (const MapPairView pairView : sortedSummaryAllocViews)
-            {
+                const auto steBucketAllocSummaryInfoPair{std::make_pair(&steBucket, &bucketInfo.m_OverallSummaryInfo)};
                 logLines += "\n\n--------------------------------------------------"sv;
-                logLines += FormatAllocationSummaryInfo(pairView);
-                if (type == LogSummaryType::FullStackTraces)
+                logLines += FormatSTEAllocationSummaryInfoPair(steBucketAllocSummaryInfoPair);
+                if constexpr (Type == LogSummaryType::FullStackTraces)
                 {
-                    for (const auto pStackTrace : pairView->second.m_FullStackTraces)
+                    for (const auto& [pFullStackTrace, stackTraceAllocSummaryInfo] : bucketInfo.GetFullStackTracesSortedByBytesDescending())
                     {
+                        const auto fullStackAllocSummaryInfoPair{std::make_pair(pFullStackTrace, &stackTraceAllocSummaryInfo)};
                         logLines += "\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"sv;
-                        logLines += std::format("\n\n{}", *pStackTrace);
+                        logLines += FormatFullStackTraceAllocationSummaryInfoPair(fullStackAllocSummaryInfoPair);
                     }
                 }
             }
-            logLines += "\n\n=================================================="sv;
         }
-        else
-        {
-            std::ranges::for_each(m_StackTraceEntryToMemoryInfoSetMap, CountMetrics);
-        }
+
+        logLines += "\n\n=================================================="sv;
 
         auto BytesPerAllocationAverage = [](_In_ const auto bytes, _In_ const auto allocs)
         {
@@ -485,19 +627,14 @@ namespace AllocationTracking
             return static_cast<std::size_t>(std::ceil(static_cast<double>(bytes) / static_cast<double>(allocs)));
         };
 
-        if (type == LogSummaryType::Limited)
-        {
-            logLines += "\n\n=================================================="sv;
-        }
-
+        const auto extAllocCount{g_ExternalAllocations.load()};
+        const auto extAllocBytes{g_ExternalAllocationBytes.load()};
         const auto trackerAllocCount{g_InternalAllocations.load()};
-        const auto trackerByteCount{g_InternalAllocationBytes.load()};
+        const auto trackerAllocBytes{g_InternalAllocationBytes.load()};
         logLines += std::format("\n\n  Total External[{} : {} ({})]\n  Total Tracker[{} : {} ({}) (~{}/ExtAlloc)]\n",
-            FmtDec{}(overallAllocSummaryInfo.m_TotalAllocations),
-            FmtByteUpToMebibyte{}(overallAllocSummaryInfo.m_TotalBytes), FmtByte{}(overallAllocSummaryInfo.m_TotalBytes),
-            FmtDec{}(trackerAllocCount),
-            FmtByteUpToMebibyte{}(trackerByteCount), FmtByte{}(trackerByteCount),
-            FmtByte{}(BytesPerAllocationAverage(trackerByteCount, overallAllocSummaryInfo.m_TotalAllocations)));
+            FmtDec{}(extAllocCount), FmtByteUpToMebibyte{}(extAllocBytes), FmtByte{}(extAllocBytes),
+            FmtDec{}(trackerAllocCount), FmtByteUpToMebibyte{}(trackerAllocBytes), FmtByte{}(trackerAllocBytes),
+            FmtByte{}(BytesPerAllocationAverage(trackerAllocBytes, extAllocCount)));
 
         logLines += "\n\n==================================================\n\n"sv;
 
@@ -507,81 +644,6 @@ namespace AllocationTracking
     void GlobalTracker::AddExternalStackEntryMarkerUnsafe(_In_ const std::string_view markerSV)
     {
         m_ExternalUserStackTraceEntryMarkers.emplace_back(markerSV);
-    }
-
-    [[nodiscard]] GlobalTracker::StackTraceEntryToMemoryInfoSetMap::iterator
-        GlobalTracker::FindSTEHashMapElement(_In_ const MemoryInfo& info)
-    {
-        for (const auto& entry : info.m_StackTrace.ToSpan())
-        {
-            const auto itr{m_StackTraceEntryToMemoryInfoSetMap.find(entry)};
-            if (itr != m_StackTraceEntryToMemoryInfoSetMap.end())
-            {
-                return itr;
-            }
-        }
-
-        return m_StackTraceEntryToMemoryInfoSetMap.end();
-    }
-
-    /**/
-    [[nodiscard]] bool GlobalTracker::IsExternalStackTraceEntryByDescriptionUnsafe(
-            _In_ const std::stacktrace_entry entry) const
-    {
-        // We need to allocate for the STE description, so we'll disable tracking
-        // for the temporary alloc to avoid re-entry issues.
-        ScopedNoTrackAllocationOrFreeSetter scopedNoTrack;
-
-        using namespace std::literals::string_view_literals;
-        static constexpr std::array s_cExternalStackTraceEntryMarkers
-        {
-            "!std::"sv,
-            "!`std::"sv,
-            "!__std"sv,
-            "!AllocationTracking::"sv,
-            "!`AllocationTracking::"sv,
-            "!operator new"sv,
-            "!operator delete"sv,
-            "!_malloc_base"sv,
-            "!_realloc_base"sv,
-            "!_calloc_base"sv,
-            "!`anonymous namespace'::"sv,
-        };
-
-        const std::string desc{entry.description()};
-        const std::string_view descSV{desc};
-
-        if (std::ranges::any_of(
-            s_cExternalStackTraceEntryMarkers,
-            [descSV](_In_ const std::string_view marker) { return descSV.contains(marker); }))
-        {
-            return true;
-        }
-
-        if (std::ranges::any_of(
-            m_ExternalUserStackTraceEntryMarkers,
-            [descSV](_In_ const std::string_view marker) { return descSV.contains(marker); }))
-        {
-            return true;
-        }
-
-        if (!!m_TargetModuleNamePrefix.empty() ||
-            !descSV.starts_with(m_TargetModuleNamePrefix))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    [[nodiscard]] std::stacktrace_entry
-        GlobalTracker::FindFirstNonExternalStackTraceEntryByDescriptionUnsafe(
-            _In_ const MemoryInfo& info) const
-    {
-        const auto stSpan{info.m_StackTrace.ToSpan()};
-        const auto itr{std::ranges::find_if_not(stSpan,
-            [this](const auto entry) { return IsExternalStackTraceEntryByDescriptionUnsafe(entry); })};
-        return (itr == stSpan.cend()) ? std::stacktrace_entry{} : *itr;
     }
 
     void GlobalTracker::ProcessAllocationUnsafe(_Inout_ MemoryInfo&& info)
@@ -745,17 +807,28 @@ namespace AllocationTracking
 
     void GlobalTracker::LogSummary(
         _In_ const LogCallback& logFn,
-        _In_ const LogSummaryType type,
-        _In_ const bool waitForWorkerThreadLull) const
+        _In_ const LogSummaryType type) const
     {
-        if (waitForWorkerThreadLull)
-        {
-            // Temporary lock grab to wait for WorkerThread to finish in-progress batch of work.
-            auto waitSpinScoped{m_WorkerThread.m_WorkerThreadInProgressLock.AcquireScoped()};
-        }
-        auto scopedLock{m_TrackerLock.AcquireScoped()};
+        using Type = LogSummaryType;
+
         ScopedNoTrackAllocationOrFreeSetter scopedNoTrack;
-        LogSummaryUnsafe(logFn, type);
+        switch (type)
+        {
+        case Type::Limited:
+            LogSummaryImpl<Type::Limited>(CreateLogInformationPackage<true>(), logFn);
+            break;
+
+        case Type::Normal:
+            LogSummaryImpl<Type::Normal>(CreateLogInformationPackage<false>(), logFn);
+            break;
+
+        case Type::FullStackTraces:
+            LogSummaryImpl<Type::FullStackTraces>(CreateLogInformationPackage<false>(), logFn);
+            break;
+
+        default:
+            __debugbreak();
+        }
     }
 }
 
@@ -764,13 +837,12 @@ namespace AllocationTracking
 {
     void LogAllocations(
         _In_ const LogCallback& logFn,
-        _In_ const LogSummaryType type,
-        _In_ const bool bWaitForWorkerThreadLull /* = false */)
+        _In_ const LogSummaryType type)
     {
         const auto pTracker = GlobalTracker::Instance();
         if (!!pTracker)
         {
-            pTracker->LogSummary(logFn, type, bWaitForWorkerThreadLull);
+            pTracker->LogSummary(logFn, type);
         }
     }
 }

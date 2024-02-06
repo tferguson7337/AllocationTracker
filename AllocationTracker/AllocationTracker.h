@@ -26,8 +26,7 @@ namespace AllocationTracking
 
     ALLOCTRACKER_DECLSPEC_DLL void LogAllocations(
         _In_ const LogCallback& logFn,
-        _In_ const LogSummaryType type,
-        _In_ const bool waitForWorkerThreadLull = false);
+        _In_ const LogSummaryType type);
 }
 
 

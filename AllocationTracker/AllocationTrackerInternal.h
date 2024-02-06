@@ -92,18 +92,17 @@ namespace AllocationTracking
         [[nodiscard]] _Ret_notnull_ _Post_writable_size_(elems) constexpr ElemT* allocate(_In_ const std::size_t elems) const
         {
             ScopedInternalAllocationOrFreeSetter scopedInternalAlloc;
-            const auto bytes = (elems * sizeof(ElemT));
+            const std::size_t bytes{elems * sizeof(ElemT)};
             ++g_InternalAllocations;
             g_InternalAllocationBytes += bytes;
-            return static_cast<ElemT*>(::operator new(elems * sizeof(ElemT)));
+            return static_cast<ElemT*>(::operator new(bytes));
         }
 
         constexpr void deallocate(_In_opt_ ElemT* ptr, _In_ const std::size_t elems) const
         {
             ScopedInternalAllocationOrFreeSetter scopedInternalFree;
-            const auto bytes = (elems * sizeof(ElemT));
             --g_InternalAllocations;
-            g_InternalAllocationBytes -= bytes;
+            g_InternalAllocationBytes -= (elems * sizeof(ElemT));
             ::operator delete(static_cast<void*>(ptr));
         }
 
@@ -227,7 +226,7 @@ namespace AllocationTracking
                     }
 
                     Reset();
-                    m_pArr = ptr;
+                    m_pArr = pNewArr;
                     m_Len = len;
                 }
             }
@@ -255,6 +254,10 @@ namespace AllocationTracking
         {
             if (!!m_pArr)
             {
+                for (ElemT* ptr = m_pArr; ptr != (m_pArr + m_Len); ++ptr)
+                {
+                    std::destroy_at(ptr);
+                }
                 AllocT{}.deallocate(m_pArr, m_Len);
                 m_pArr = nullptr;
                 m_Len = 0;
@@ -575,7 +578,7 @@ namespace AllocationTracking
             m_bOwned.clear(std::memory_order::release);
         }
 
-        auto AcquireScoped() noexcept
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -620,7 +623,7 @@ namespace AllocationTracking
             }
         }
 
-        auto AcquireScoped() noexcept
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -694,7 +697,7 @@ namespace AllocationTracking
         }
 
         __declspec(noinline)
-        auto AcquireScoped()
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -719,7 +722,7 @@ namespace AllocationTracking
             m_Mutex.unlock();
         }
 
-        auto AcquireScoped()
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -762,6 +765,23 @@ namespace AllocationTracking
 
 namespace AllocationTracking
 {
+    using StringT = std::basic_string<char, std::char_traits<char>, SelfAllocator<char>>;
+    using ExternalUserStackTraceEntryMarkers = std::vector<StringT, SelfAllocator<StringT>>;
+
+    // Information needed for logging allocation tracking summaries.
+    struct LogInformationPackage
+    {
+        std::int64_t m_InternalAllocCount;
+        std::int64_t m_InternalAllocBytes;
+
+        std::int64_t m_ExternalAllocCount;
+        std::int64_t m_ExternalAllocBytes;
+
+        MemoryInfoSet m_MemoryInfoSet;
+        ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
+        StringT m_TargetModuleNamePrefix;
+    };
+
     class GlobalTracker
     {
     private:
@@ -793,9 +813,6 @@ namespace AllocationTracking
 
             std::atomic<bool> m_bContinueWork{true};
 
-            // Used for when a LogAllocation request comes in and wishes to wait for current worker loop to complete.
-            PreferredLock m_WorkerThreadInProgressLock;
-
             // Note: It's important that this is last
             std::jthread m_Thread;
 
@@ -823,65 +840,38 @@ namespace AllocationTracking
 
     private:
 
-        using StringT = std::basic_string<char, std::char_traits<char>, SelfAllocator<char>>;
-
-        using StackTraceEntryToMemoryInfoSetMap = std::unordered_map<std::stacktrace_entry, MemoryInfoSet, std::hash<std::stacktrace_entry>, std::equal_to<std::stacktrace_entry>, SelfAllocator<std::pair<const std::stacktrace_entry, MemoryInfoSet>>>;
-        StackTraceEntryToMemoryInfoSetMap m_StackTraceEntryToMemoryInfoSetMap;
-
-        using CachedInfo = std::pair<std::stacktrace_entry, MemoryInfoSet::const_iterator>;
-        using AllocationAddrToCachedInfoMap = std::map<void*, CachedInfo, std::less<>, SelfAllocator<std::pair<void* const, CachedInfo>>>;
-        AllocationAddrToCachedInfoMap m_AllocationAddrToCachedInfoMap;
-
-        using AllocationAddrToMemoryInfoMap = std::map<const void*, MemoryInfo, std::less<>, SelfAllocator<std::pair<const void* const, MemoryInfo>>>;
         MemoryInfoSet m_MemoryInfoSet;
 
-        using ExternalUserStackTraceEntryMarkers = std::vector<StringT, SelfAllocator<StringT>>;
         ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
-
         StringT m_TargetModuleNamePrefix;
 
         std::atomic<bool> m_bCollectFullStackTraces{true};
 
-        struct AllocSummaryInfo
+        template <bool bLimited>
+        [[nodiscard]] LogInformationPackage CreateLogInformationPackage() const
         {
-            std::size_t m_TotalBytes{0};
-            std::size_t m_TotalAllocations{0};
-
-            MemoryInfo::TimePoint m_OldestAllocation{(MemoryInfo::TimePoint::max)()};
-            MemoryInfo::TimePoint m_NewestAllocation{(MemoryInfo::TimePoint::min)()};
-
-            struct FullStackTracePtrLess
+            LogInformationPackage pkg
             {
-                [[nodiscard]] constexpr bool operator()(
-                    _In_ const StackTraceT* pLhs,
-                    _In_ const StackTraceT* pRhs) const noexcept
-                {
-                    return *pLhs < *pRhs;
-                }
+                .m_InternalAllocCount = g_InternalAllocations,
+                .m_InternalAllocBytes = g_InternalAllocationBytes,
+
+                .m_ExternalAllocCount = g_ExternalAllocations,
+                .m_ExternalAllocBytes = g_ExternalAllocationBytes
             };
 
-            using FullStackTracePtrSet = std::set<const StackTraceT*, FullStackTracePtrLess, NonTrackingAllocator<const StackTraceT*>>;
-            FullStackTracePtrSet m_FullStackTraces;
+            if constexpr (!bLimited)
+            {
+                // We'll need to grab lock to copy required structures.
+                const auto scopedTrackerLock{m_TrackerLock.AcquireScoped()};
+                pkg.m_MemoryInfoSet = m_MemoryInfoSet;
+                pkg.m_ExternalUserStackTraceEntryMarkers = m_ExternalUserStackTraceEntryMarkers;
+                pkg.m_TargetModuleNamePrefix = m_TargetModuleNamePrefix;
+            }
 
-            AllocSummaryInfo() noexcept;
-            AllocSummaryInfo(_In_ const MemoryInfo& info) noexcept;
-
-            AllocSummaryInfo& operator<<(_In_ const AllocSummaryInfo& other) noexcept;
-        };
-
-        // Logs each unique alloc-stacktrace, with total bytes each trace has allocated.
-        // Also logs total allocations, total bytes overall, and tracking overhead bytes.
-        void LogSummaryUnsafe(
-            _In_ const LogCallback& logFn,
-            _In_ const LogSummaryType type) const;
+            return pkg;
+        }
 
         void AddExternalStackEntryMarkerUnsafe(_In_ const std::string_view markerSV);
-
-        [[nodiscard]] StackTraceEntryToMemoryInfoSetMap::iterator FindSTEHashMapElement(_In_ const MemoryInfo& info);
-
-        [[nodiscard]] bool IsExternalStackTraceEntryByDescriptionUnsafe(_In_ const std::stacktrace_entry entry) const;
-
-        [[nodiscard]] std::stacktrace_entry FindFirstNonExternalStackTraceEntryByDescriptionUnsafe(_In_ const MemoryInfo& info) const;
 
         void ProcessAllocationUnsafe(_Inout_ MemoryInfo&& info);
 
@@ -897,7 +887,6 @@ namespace AllocationTracking
 
         [[nodiscard]] static std::shared_ptr<GlobalTracker> Instance() noexcept;
 
-        __declspec(noinline)
         [[nodiscard]] static std::shared_ptr<GlobalTracker> InstanceIfTrackingEnabled() noexcept;
 
         void SetTargetModuleNamePrefix(_In_ const std::string_view prefixSV);
@@ -919,7 +908,6 @@ namespace AllocationTracking
 
         void LogSummary(
             _In_ const LogCallback& logFn,
-            _In_ const LogSummaryType type,
-            _In_ const bool waitForWorkerThreadLull) const;
+            _In_ const LogSummaryType type) const;
     };
 }

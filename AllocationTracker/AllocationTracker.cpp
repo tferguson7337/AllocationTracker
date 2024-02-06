@@ -641,10 +641,10 @@ namespace AllocationTracking
             return static_cast<std::size_t>(std::ceil(static_cast<double>(bytes) / static_cast<double>(allocs)));
         };
 
-        const auto extAllocCount{g_ExternalAllocations.load()};
-        const auto extAllocBytes{g_ExternalAllocationBytes.load()};
-        const auto trackerAllocCount{g_InternalAllocations.load()};
-        const auto trackerAllocBytes{g_InternalAllocationBytes.load()};
+        const auto extAllocCount{infoPkg.m_ExternalAllocCount};
+        const auto extAllocBytes{infoPkg.m_ExternalAllocBytes};
+        const auto trackerAllocCount{infoPkg.m_InternalAllocCount};
+        const auto trackerAllocBytes{infoPkg.m_InternalAllocBytes};
         logLines += std::format("\n\n  Total External[{} : {} ({})]\n  Total Tracker[{} : {} ({}) (~{}/ExtAlloc)]\n",
             FmtDec{}(extAllocCount), FmtByteUpToMebibyte{}(extAllocBytes), FmtByte{}(extAllocBytes),
             FmtDec{}(trackerAllocCount), FmtByteUpToMebibyte{}(trackerAllocBytes), FmtByte{}(trackerAllocBytes),

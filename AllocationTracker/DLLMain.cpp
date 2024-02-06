@@ -32,8 +32,6 @@ namespace AllocationTracking
     using BaseThreadInitThunkFn = void(WINAPI*)(DWORD, LPTHREAD_START_ROUTINE, LPVOID);
     BaseThreadInitThunkFn s_RealBaseThreadInitThunk{nullptr};
 
-    PreferredRecursiveLock g_AllocFreeMutex;
-
     thread_local std::uint32_t gtl_ReentryCount{0};
     struct ScopedReentryCountIncrementer
     {
@@ -183,8 +181,6 @@ namespace AllocationTracking
 
         auto AllocTS = [=]()
         {
-            auto scopedAllocFreeLock{g_AllocFreeMutex.AcquireScoped()};
-
             ScopedReentryCountIncrementer scopedReentryCountIncrementer;
             MemoryInfo info{
                 .m_pMem = s_RealHeapAlloc(hHeap, dwFlags, bytes),
@@ -206,8 +202,6 @@ namespace AllocationTracking
 
         auto ReAllocTs = [=]()
         {
-            auto scopedAllocFreeLock{g_AllocFreeMutex.AcquireScoped()};
-
             // Note: grab original size of allocation before we realloc.
             const SIZE_T originalBytes{HeapSize(hHeap, dwFlags, ptr)};
 
@@ -225,6 +219,11 @@ namespace AllocationTracking
     BOOL WINAPI HeapFreeDetour(HANDLE hHeap, DWORD dwFlags, LPVOID ptr)
     {
         static constexpr auto s_OpFlag{OpFlag::Free};
+
+        if (!ptr)
+        {
+            return TRUE;
+        }
 
         if (ShouldSkipTracking<s_OpFlag>())
         {
@@ -257,8 +256,6 @@ namespace AllocationTracking
         BOOL bSuccess{FALSE};
         auto FreeTs = [hHeap, dwFlags, ptr, &bSuccess]()
         {
-            auto scopedAllocFreeLock{g_AllocFreeMutex.AcquireScoped()};
-
             const SIZE_T bytes{HeapSize(hHeap, dwFlags, ptr)};
 
             ScopedReentryCountIncrementer scopedReentryCountIncrementer;

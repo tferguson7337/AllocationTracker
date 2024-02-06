@@ -455,7 +455,18 @@ namespace AllocationTracking
         const auto stSpan{info.m_StackTrace.ToSpan()};
         const auto itr{std::ranges::find_if(stSpan,
             [&infoPkg](const auto entry) { return IsUserStackTraceEntry(infoPkg, entry); })};
-        return (itr == stSpan.cend()) ? stSpan.front() : *itr;
+        if (itr != stSpan.cend())
+        {
+            return *itr;
+        }
+
+        // This might be a purely internal stacktrace.
+        // See if the bottom frame contains "!thread_start"
+        // If so, use the one above it; otherwise use the bottom frame.
+        ScopedNoTrackAllocationOrFreeSetter scopedNoTrack;
+        return (stSpan.size() > 1 && stSpan.back().description().contains("!thread_start"))
+            ? stSpan[stSpan.size() - 2]
+            : stSpan.back();
     }
 
     template <LogSummaryType Type>
@@ -785,7 +796,7 @@ namespace AllocationTracking
         ++g_ExternalAllocations;
 
         using StdStackTraceT = StdStackTraceWithAllocatorT<SelfAllocator<std::stacktrace_entry>>;
-        info.m_StackTrace = StdStackTraceT::current(1, s_cMaxStackTraceFrames);
+        info.m_StackTrace = StdStackTraceT::current(2, s_cMaxStackTraceFrames);
 
         gtl_ThreadTracker.AddToQueue(std::move(info));
     }

@@ -182,22 +182,37 @@ namespace AllocationTracking
         //
         StackTraceEntryArray& operator=(_In_ const StdStackTraceT& allocStackTrace)
         {
-            const auto len{static_cast<std::size_t>(std::ranges::distance(allocStackTrace))};
-            ElemT* const pNewArr{SelfAllocator<ElemT>{}.allocate(len)};
+            const auto copyLen = [&allocStackTrace]()
+            {
+                // For a stacktrace from frames [0, N), the last two frames of the stack always appear to be:
+                //  N-2> KERNEL32!BaseThreadInitThunk+0x1D
+                //  N-1> ntdll!RtlUserThreadStart+0x28
+                //
+                //  If we have more than 2 frames, exclude these last two frames.
+                //
+                const auto tmpLen{static_cast<std::size_t>(std::ranges::distance(allocStackTrace))};
+                return (tmpLen > 2)
+                    ? tmpLen - 2
+                    : tmpLen;
+            }();
+
+            ElemT* const pNewArr{SelfAllocator<ElemT>{}.allocate(copyLen)};
 
             ElemT* ptr = pNewArr;
-            for (const auto& ste : allocStackTrace)
+            for (auto itr = allocStackTrace.cbegin(), end = std::next(allocStackTrace.cbegin(), copyLen);
+                itr != end;
+                ++itr, ++ptr)
             {
-                std::construct_at(ptr++, ste);
+                std::construct_at(ptr, *itr);
             }
-            if (pNewArr != (ptr - len)) [[unlikely]]
+            if ((pNewArr + copyLen) != ptr) [[unlikely]]
             {
                 __debugbreak();
             }
 
             Reset();
             m_pArr = pNewArr;
-            m_Len = len;
+            m_Len = copyLen;
 
             return *this;
         }

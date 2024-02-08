@@ -169,6 +169,7 @@ void AllocateForTestBuffer(_In_ const std::size_t idx)
     /**/
 }
 
+template <AllocationTracking::LogSummaryType LogType>
 void LogAllocs()
 {
     if (!g_pDispatchLogger.Get())
@@ -181,22 +182,19 @@ void LogAllocs()
         g_pDispatchLogger->Log("{}", logMsgSV);
     };
 
-    static constexpr auto s_cLogType{AllocationTracking::LogSummaryType::FullStackTraces};
     const auto pfLogAllocaitons = reinterpret_cast<AllocationTracking::LogAllocationsFn>(
         GetProcAddress(g_hAllocationTrackerLib, "AllocationTracker_LogAllocations"));
     if (!!pfLogAllocaitons)
     {
-        pfLogAllocaitons(LogCallback, s_cLogType);
+        pfLogAllocaitons(LogCallback, LogType);
     }
 }
 
 
 void RunTrackerTests()
 {
-    // LogAllocs();
     {
         g_pTestBuffers = std::make_unique<TestBuffersArray>();
-        // LogAllocs();
 
         {
             const auto allocT0{std::chrono::steady_clock::now()};
@@ -206,8 +204,6 @@ void RunTrackerTests()
             g_pStdOutLogger->Log("Test Buffer Alloc Duration[{}]", std::chrono::duration_cast<std::chrono::milliseconds>(dur));
         }
 
-        // LogAllocs();
-
         {
             const auto freeT0{std::chrono::steady_clock::now()};
             g_pTestBuffers.reset();
@@ -215,21 +211,19 @@ void RunTrackerTests()
             g_pStdOutLogger->Log("Test Buffer Free Duration[{}]", std::chrono::duration_cast<std::chrono::milliseconds>(freeT1 - freeT0));
         }
     }
-    // LogAllocs();
+
     {
         static constexpr std::size_t s_cElems = (1 << 30);
         auto ptr = std::make_unique<std::uint32_t[]>(s_cElems);
         if (!!ptr) { std::fill(&ptr[0], &ptr[s_cElems], 0); } // Touch the memory so it gets committed.
-        // LogAllocs();
     }
 
     for (auto i = 0u; i < 10u; ++i)
     {
-        // LogAllocs();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    LogAllocs();
+    LogAllocs<AllocationTracking::LogSummaryType::Normal>();
 }
 
 

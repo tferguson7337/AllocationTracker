@@ -503,7 +503,6 @@ BOOL WINAPI DllMain(
         {
         case DLL_PROCESS_ATTACH:
         {
-            __debugbreak();
             AllocationTracking::s_dwTlsIndex = TlsAlloc();
             if (AllocationTracking::s_dwTlsIndex == TLS_OUT_OF_INDEXES)
             {

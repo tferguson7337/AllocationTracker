@@ -35,6 +35,8 @@ namespace AllocationTracking
     constinit std::atomic<std::int64_t> g_ExternalAllocations{0};
     constinit std::atomic<std::int64_t> g_ExternalAllocationBytes{0};
 
+    constinit std::atomic<std::size_t> g_BacklogCount{0};
+
     constinit std::atomic<bool> g_bTrackingEnabled{false};
 }
 
@@ -87,6 +89,7 @@ namespace AllocationTracking
         {
             pGlobalTracker->RegisterThreadTracker(this);
             m_bRegistered = true;
+            m_bTrackingReady = true;
         }
 
         return m_bRegistered;
@@ -117,6 +120,7 @@ namespace AllocationTracking
         }
 
         auto scopedLock{m_QueueBusyLock.AcquireScoped()};
+        ++g_BacklogCount;
         m_Queue.push_back(std::move(info));
     }
 
@@ -234,6 +238,8 @@ namespace AllocationTracking
                     {
                         pTracker->ProcessDeallocationUnsafe(std::move(info));
                     }
+
+                    --g_BacklogCount;
                 }
             }
         }
@@ -293,6 +299,7 @@ namespace AllocationTracking
     void GlobalTracker::WorkerThread::AddToDeregisteredFreeQueue(_Inout_ DeregisteredMemoryFreeInfo&& info)
     {
         auto scopedDeregisteredFreeQueueLock{m_DeregisteredFreeQueueLock.AcquireScoped()};
+        ++g_BacklogCount;
         m_DeregisteredFreeQueue.AddToQueue(std::move(info));
     }
 }
@@ -645,10 +652,11 @@ namespace AllocationTracking
         const auto extAllocBytes{infoPkg.m_ExternalAllocBytes};
         const auto trackerAllocCount{infoPkg.m_InternalAllocCount};
         const auto trackerAllocBytes{infoPkg.m_InternalAllocBytes};
-        logLines += std::format("\n\n  Total External[{} : {} ({})]\n  Total Tracker[{} : {} ({}) (~{}/ExtAlloc)]\n",
+        logLines += std::format("\n\n  Total External[{} : {} ({})]\n  Total Tracker[{} : {} ({}) (~{}/ExtAlloc)]\n  Backlog[{}]\n",
             FmtDec{}(extAllocCount), FmtByteUpToMebibyte{}(extAllocBytes), FmtByte{}(extAllocBytes),
             FmtDec{}(trackerAllocCount), FmtByteUpToMebibyte{}(trackerAllocBytes), FmtByte{}(trackerAllocBytes),
-            FmtByte{}(BytesPerAllocationAverage(trackerAllocBytes, extAllocCount)));
+            FmtByte{}(BytesPerAllocationAverage(trackerAllocBytes, extAllocCount)),
+            FmtDec{}(infoPkg.m_BacklogCount));
 
         logLines += "\n\n==================================================\n\n"sv;
 
@@ -674,7 +682,10 @@ namespace AllocationTracking
         //  Go ahead and attempt to remove the addr from our tracked set before inserting this most
         //  recent one.
         //
-        ProcessDeallocationUnsafe(info);
+        ProcessDeallocationUnsafe(info, false);
+
+        g_ExternalAllocationBytes += info.m_Bytes;
+        ++g_ExternalAllocations;
 
         const auto [itr, bEmplaced] {m_MemoryInfoSet.insert(std::move(info))};
         if (!bEmplaced) [[unlikely]]
@@ -683,34 +694,17 @@ namespace AllocationTracking
         }
     }
 
-    void GlobalTracker::ProcessDeallocationUnsafe(_In_ const MemoryInfo& info)
+    void GlobalTracker::ProcessDeallocationUnsafe(
+        _In_ const MemoryInfo& info,
+        [[maybe_unused]] _In_ const bool bActualDealloc /* = true */)
     {
-        /**
-        const auto cachedInfoMapItr = m_AllocationAddrToCachedInfoMap.find(info.m_pMem);
-        if (cachedInfoMapItr == m_AllocationAddrToCachedInfoMap.end())
+        const auto itr{m_MemoryInfoSet.find(info)};
+        if (itr != m_MemoryInfoSet.cend())
         {
-            // Must be a free for an allocation that happened prior
-            // to tracking being enabled for the allocating thread.
-            return;
+            g_ExternalAllocationBytes -= itr->m_Bytes;
+            --g_ExternalAllocations;
+            m_MemoryInfoSet.erase(itr);
         }
-
-        const auto& [hashMapKey, infoSetItr] = cachedInfoMapItr->second;
-        const auto hashMapItr = m_StackTraceEntryToMemoryInfoSetMap.find(hashMapKey);
-        if (hashMapItr != m_StackTraceEntryToMemoryInfoSetMap.end())
-        {
-            if (hashMapItr->second.size() <= 1)
-            {
-                m_StackTraceEntryToMemoryInfoSetMap.erase(hashMapItr);
-            }
-            else
-            {
-                hashMapItr->second.erase(infoSetItr);
-            }
-        }
-        m_AllocationAddrToCachedInfoMap.erase(cachedInfoMapItr);
-        /**/
-
-        m_MemoryInfoSet.erase(info);
     }
 
     void GlobalTracker::Init()
@@ -792,9 +786,6 @@ namespace AllocationTracking
             __debugbreak();
         }
 
-        g_ExternalAllocationBytes += info.m_Bytes;
-        ++g_ExternalAllocations;
-
         using StdStackTraceT = StdStackTraceWithAllocatorT<SelfAllocator<std::stacktrace_entry>>;
         info.m_StackTrace = StdStackTraceT::current(2, s_cMaxStackTraceFrames);
 
@@ -807,9 +798,6 @@ namespace AllocationTracking
         {
             __debugbreak();
         }
-
-        g_ExternalAllocationBytes -= info.m_Bytes;
-        --g_ExternalAllocations;
 
         gtl_ThreadTracker.AddToQueue(std::move(info));
     }

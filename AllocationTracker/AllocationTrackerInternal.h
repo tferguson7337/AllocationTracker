@@ -53,8 +53,11 @@ namespace AllocationTracking
     extern std::atomic<std::int64_t> g_InternalAllocations;
     extern std::atomic<std::int64_t> g_InternalAllocationBytes;
 
+    // TODO: Could move external and backlog counters to GlobalTracker (protected by m_TrackerLock)
     extern std::atomic<std::int64_t> g_ExternalAllocations;
     extern std::atomic<std::int64_t> g_ExternalAllocationBytes;
+
+    extern std::atomic<std::size_t> g_BacklogCount;
 
     extern std::atomic<bool> g_bTrackingEnabled;
 }
@@ -433,7 +436,8 @@ namespace AllocationTracking
             return MemoryInfo{
                 .m_Id = m_Id,
                 .m_pMem = m_pMem,
-                .m_Bytes = m_Bytes};
+                .m_Bytes = m_Bytes,
+                .m_OpFlagMask = OpFlag::Free};
         }
     };
 
@@ -786,11 +790,13 @@ namespace AllocationTracking
     // Information needed for logging allocation tracking summaries.
     struct LogInformationPackage
     {
-        std::int64_t m_InternalAllocCount;
-        std::int64_t m_InternalAllocBytes;
+        std::int64_t m_InternalAllocCount{0};
+        std::int64_t m_InternalAllocBytes{0};
 
-        std::int64_t m_ExternalAllocCount;
-        std::int64_t m_ExternalAllocBytes;
+        std::int64_t m_ExternalAllocCount{0};
+        std::int64_t m_ExternalAllocBytes{0};
+
+        std::size_t m_BacklogCount{0};
 
         MemoryInfoSet m_MemoryInfoSet;
         ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
@@ -871,7 +877,9 @@ namespace AllocationTracking
                 .m_InternalAllocBytes = g_InternalAllocationBytes,
 
                 .m_ExternalAllocCount = g_ExternalAllocations,
-                .m_ExternalAllocBytes = g_ExternalAllocationBytes
+                .m_ExternalAllocBytes = g_ExternalAllocationBytes,
+
+                .m_BacklogCount = g_BacklogCount
             };
 
             if constexpr (!bLimited)
@@ -890,7 +898,9 @@ namespace AllocationTracking
 
         void ProcessAllocationUnsafe(_Inout_ MemoryInfo&& info);
 
-        void ProcessDeallocationUnsafe(_In_ const MemoryInfo& info);
+        void ProcessDeallocationUnsafe(
+            _In_ const MemoryInfo& info,
+            _In_ const bool bActualDealloc = true);
 
         static std::shared_ptr<GlobalTracker> s_pTracker;
 

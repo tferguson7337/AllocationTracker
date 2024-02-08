@@ -19,14 +19,16 @@
 
 namespace AllocationTracking
 {
-
     using HeapAllocFn = LPVOID(WINAPI*)(HANDLE, DWORD, SIZE_T);
     using HeapReAllocFn = LPVOID(WINAPI*)(HANDLE, DWORD, LPVOID, SIZE_T);
     using HeapFreeFn = BOOL(WINAPI*)(HANDLE, DWORD, LPVOID);
 
-    HeapAllocFn s_RealHeapAlloc{&::HeapAlloc};
-    HeapReAllocFn s_RealHeapReAlloc{&::HeapReAlloc};
-    HeapFreeFn s_RealHeapFree{&::HeapFree};
+    HeapAllocFn s_RealHeapAlloc{nullptr};
+    HeapReAllocFn s_RealHeapReAlloc{nullptr};
+    HeapFreeFn s_RealHeapFree{nullptr};
+
+    using ExitUserThreadFn = void(WINAPI*)(DWORD);
+    ExitUserThreadFn s_RealExitUserThread{nullptr};
 
     // Internal function, guessing the signature here based on disassembly.
     using BaseThreadInitThunkFn = void(WINAPI*)(DWORD, LPTHREAD_START_ROUTINE, LPVOID);
@@ -60,15 +62,15 @@ namespace AllocationTracking
             return false;
         }
 
-        if (!g_bTrackingEnabled)
-        {
-            return false;
-        }
-
         if (!IsThreadLocalStorageReady())
         {
             // We need to account for late cleanup steps
             // that can occur after TLS/FLS is cleaned up.
+            return true;
+        }
+
+        if (!gtl_ThreadTracker.m_bRegistered)
+        {
             return true;
         }
 
@@ -78,6 +80,11 @@ namespace AllocationTracking
         }
 
         if (gtl_IsInternalAllocationOrFree > 0)
+        {
+            return false;
+        }
+
+        if (!g_bTrackingEnabled)
         {
             return false;
         }
@@ -230,23 +237,17 @@ namespace AllocationTracking
             // We have some extra skip-tracking logic for free scenarios, to try
             // and catch free's that happen around the time thread is exiting after
             // deregistration or TLS-free has occurred.
-            if (!IsThreadLocalStorageReady() ||
-                ((gtl_IsNoTrackAllocationOrFree == 0) &&
-                (gtl_IsInternalAllocationOrFree == 0) &&
-                (!gtl_ThreadTracker.m_bRegistered)))
+            if (ShouldAddToBacklog<s_OpFlag>())
             {
-                if (g_bTrackingEnabled)
+                // TLS is gone and/or this thread has deregistered from GlobalTracker.
+                // Add this free to the no-TLS-safe queue so we track these frees correctly.
+                auto pTracker{GlobalTracker::Instance()};
+                if (!!pTracker)
                 {
-                    // TLS is gone and/or this thread has deregistered from GlobalTracker.
-                    // Add this free to the no-TLS-safe queue so we track these frees correctly.
-                    auto pTracker{GlobalTracker::Instance()};
-                    if (!!pTracker)
-                    {
-                        pTracker->AddToDeregisteredFreeQueue(
-                            DeregisteredMemoryFreeInfo{
-                                .m_pMem = ptr,
-                                .m_Bytes = HeapSize(hHeap, dwFlags, ptr)});
-                    }
+                    pTracker->AddToDeregisteredFreeQueue(
+                        DeregisteredMemoryFreeInfo{
+                            .m_pMem = ptr,
+                            .m_Bytes = HeapSize(hHeap, dwFlags, ptr)});
                 }
             }
 
@@ -283,6 +284,22 @@ namespace AllocationTracking
         return bSuccess;
     }
 
+    void WINAPI RtlExitUserThreadDetour(DWORD dwReturnCode)
+    {
+        if (IsThreadLocalStorageReady())
+        {
+            gtl_ThreadTracker.DeregisterWithGlobalTracker();
+            LPVOID pTlsVal{TlsGetValue(s_dwTlsIndex)};
+            if (!!pTlsVal)
+            {
+                TlsSetValue(s_dwTlsIndex, nullptr);
+                LocalFree((HLOCAL)pTlsVal);
+            }
+        }
+
+        s_RealExitUserThread(dwReturnCode);
+    }
+
     void WINAPI BaseThreadInitThunkDetour(
         DWORD dwUnknown,
         LPTHREAD_START_ROUTINE lpThreadStartAddr,
@@ -303,12 +320,45 @@ class [[nodiscard]] ScopedDetourInit
 private:
     bool m_bDetourSuccess{false};
 
-    template <bool bInit>
-    bool HandleDetourWork()
+    bool PopulateRealFunctionPointers()
     {
         using namespace AllocationTracking;
+        {
+            const HMODULE hNtdllModule{GetModuleHandleA("ntdll.dll")};
+            if (!hNtdllModule)
+            {
+                return false;
+            }
 
-        if constexpr (bInit)
+            s_RealHeapAlloc = reinterpret_cast<HeapAllocFn>(
+                GetProcAddress(hNtdllModule, "RtlAllocateHeap"));
+            if (!s_RealHeapAlloc)
+            {
+                return false;
+            }
+
+            s_RealHeapReAlloc = reinterpret_cast<HeapReAllocFn>(
+                GetProcAddress(hNtdllModule, "RtlReAllocateHeap"));
+            if (!s_RealHeapReAlloc)
+            {
+                return false;
+            }
+
+            s_RealHeapFree = reinterpret_cast<HeapFreeFn>(
+                GetProcAddress(hNtdllModule, "RtlFreeHeap"));
+            if (!s_RealHeapFree)
+            {
+                return false;
+            }
+
+            s_RealExitUserThread = reinterpret_cast<ExitUserThreadFn>(
+                GetProcAddress(hNtdllModule, "RtlExitUserThread"));
+            if (!s_RealExitUserThread)
+            {
+                return false;
+            }
+        }
+
         {
             const HMODULE hKernel32Module{GetModuleHandleA("kernel32.dll")};
             if (!hKernel32Module)
@@ -316,14 +366,35 @@ private:
                 return false;
             }
 
-            const auto procAddr = reinterpret_cast<BaseThreadInitThunkFn>(
+            s_RealBaseThreadInitThunk = reinterpret_cast<BaseThreadInitThunkFn>(
                 GetProcAddress(hKernel32Module, "BaseThreadInitThunk"));
-            if (!procAddr)
+            if (!s_RealBaseThreadInitThunk)
             {
                 return false;
             }
+        }
 
-            s_RealBaseThreadInitThunk = procAddr;
+        return true;
+    }
+
+    template <bool bInit>
+    bool HandleDetourWork()
+    {
+        using namespace AllocationTracking;
+
+        if (m_bDetourSuccess == bInit)
+        {
+            // If we're initializing, but we've already detoured, return true.
+            // If we're uninitializing, but we haven't detoured, return true.
+            return true;
+        }
+
+        if constexpr (bInit)
+        {
+            if (!PopulateRealFunctionPointers())
+            {
+                return false;
+            }
         }
 
         if constexpr (bInit)
@@ -337,6 +408,13 @@ private:
         {
             return false;
         }
+
+        //
+        // TODO:
+        //  DetourUpdateThread on the current thread is a no-op.
+        //  This function is intended to suspend the specified thread until
+        //  the detour-transaction is committed, at which point the instructions are flushed.
+        //
         if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR)
         {
             DetourTransactionAbort();
@@ -348,6 +426,7 @@ private:
             if ((DetourAttach(&(LPVOID&)(s_RealHeapAlloc), HeapAllocDetour) != NO_ERROR) ||
                 (DetourAttach(&(LPVOID&)(s_RealHeapReAlloc), HeapReAllocDetour) != NO_ERROR) ||
                 (DetourAttach(&(LPVOID&)(s_RealHeapFree), HeapFreeDetour) != NO_ERROR) ||
+                (DetourAttach(&(LPVOID&)(s_RealExitUserThread), RtlExitUserThreadDetour) != NO_ERROR) ||
                 (DetourAttach(&(LPVOID&)(s_RealBaseThreadInitThunk), BaseThreadInitThunkDetour) != NO_ERROR))
 
             {
@@ -358,6 +437,7 @@ private:
         else
         {
             if ((DetourDetach(&(LPVOID&)(s_RealBaseThreadInitThunk), BaseThreadInitThunkDetour) != NO_ERROR) ||
+                (DetourDetach(&(LPVOID&)(s_RealExitUserThread), RtlExitUserThreadDetour) != NO_ERROR) ||
                 (DetourDetach(&(LPVOID&)(s_RealHeapFree), HeapFreeDetour) != NO_ERROR) ||
                 (DetourDetach(&(LPVOID&)(s_RealHeapReAlloc), HeapReAllocDetour) != NO_ERROR) ||
                 (DetourDetach(&(LPVOID&)(s_RealHeapAlloc), HeapAllocDetour) != NO_ERROR))
@@ -423,6 +503,7 @@ BOOL WINAPI DllMain(
         {
         case DLL_PROCESS_ATTACH:
         {
+            __debugbreak();
             AllocationTracking::s_dwTlsIndex = TlsAlloc();
             if (AllocationTracking::s_dwTlsIndex == TLS_OUT_OF_INDEXES)
             {
@@ -460,17 +541,7 @@ BOOL WINAPI DllMain(
 
         case DLL_THREAD_DETACH:
         {
-            if (AllocationTracking::s_dwTlsIndex != TLS_OUT_OF_INDEXES)
-            {
-                LPVOID pTlsVal{TlsGetValue(AllocationTracking::s_dwTlsIndex)};
-                if (!!pTlsVal)
-                {
-                    // Note: Thread will deregister tracker from Global upon TLS cleanup.
-                    // AllocationTracking::gtl_ThreadTracker.DeregisterWithGlobalTracker();
-                    LocalFree((HLOCAL)pTlsVal);
-                }
-            }
-
+            /* We handle TLS cleanup in RtlExitUserThread detour */
             break;
         }
 

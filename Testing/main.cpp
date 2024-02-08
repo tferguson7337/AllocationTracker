@@ -118,7 +118,7 @@ void GenerateLoggers()
         SLL::Factory<SLL::FileLogger>{}(s_cFileLoggerPath));
 }
 
-static constexpr std::size_t s_cTestBuffersArrayLength{64};
+static constexpr std::size_t s_cTestBuffersArrayLength{32};
 using TestBuffers = std::vector<std::vector<std::uint8_t>>;
 using TestBuffersArray = std::array<TestBuffers, s_cTestBuffersArrayLength>;
 std::unique_ptr<TestBuffersArray> g_pTestBuffers;

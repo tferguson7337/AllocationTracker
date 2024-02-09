@@ -50,11 +50,14 @@ namespace AllocationTracking
         }
     };
 
-    extern std::atomic<std::uint64_t> g_InternalAllocations;
-    extern std::atomic<std::uint64_t> g_InternalAllocationBytes;
+    extern std::atomic<std::int64_t> g_InternalAllocations;
+    extern std::atomic<std::int64_t> g_InternalAllocationBytes;
 
-    extern std::atomic<std::uint64_t> g_ExternalAllocations;
-    extern std::atomic<std::uint64_t> g_ExternalAllocationBytes;
+    // TODO: Could move external and backlog counters to GlobalTracker (protected by m_TrackerLock)
+    extern std::atomic<std::int64_t> g_ExternalAllocations;
+    extern std::atomic<std::int64_t> g_ExternalAllocationBytes;
+
+    extern std::atomic<std::size_t> g_BacklogCount;
 
     extern std::atomic<bool> g_bTrackingEnabled;
 }
@@ -92,18 +95,17 @@ namespace AllocationTracking
         [[nodiscard]] _Ret_notnull_ _Post_writable_size_(elems) constexpr ElemT* allocate(_In_ const std::size_t elems) const
         {
             ScopedInternalAllocationOrFreeSetter scopedInternalAlloc;
-            const auto bytes = (elems * sizeof(ElemT));
+            const std::size_t bytes{elems * sizeof(ElemT)};
             ++g_InternalAllocations;
             g_InternalAllocationBytes += bytes;
-            return static_cast<ElemT*>(::operator new(elems * sizeof(ElemT)));
+            return static_cast<ElemT*>(::operator new(bytes));
         }
 
         constexpr void deallocate(_In_opt_ ElemT* ptr, _In_ const std::size_t elems) const
         {
             ScopedInternalAllocationOrFreeSetter scopedInternalFree;
-            const auto bytes = (elems * sizeof(ElemT));
             --g_InternalAllocations;
-            g_InternalAllocationBytes -= bytes;
+            g_InternalAllocationBytes -= (elems * sizeof(ElemT));
             ::operator delete(static_cast<void*>(ptr));
         }
 
@@ -126,11 +128,15 @@ namespace AllocationTracking
     using StdStackTraceWithAllocatorT = std::basic_stacktrace<AllocT>;
 
     //
-    // We need our own trimmed down `std::basic_stacktrace`, since with MSVC it rather annoyingly overallocates
-    // its internal std::vector with 0xFFFF capacity when you call `current`, but doesn't shrink_to_fit.
-    // Even if you call `current` with max_depth specified, it'll allocate max_depth elements and never shrink.
-    // If we don't do this, every tracked allocation would take ~512KB or (max_depth * sizeof(void*)).
-    // At the very least we can deal with the temporary alloc from `current` and copy just what we need to a smaller buffer.
+    // Note:
+    //  We need our own trimmed down `std::basic_stacktrace`, since with MSVC it rather annoyingly overallocates
+    //  its internal std::vector with 0xFFFF capacity when you call `current`, but doesn't shrink_to_fit.
+    //  Even if you call `current` with max_depth specified, it'll allocate max_depth elements and never shrink.
+    //  If we don't do this, every tracked allocation would take ~512KB or (max_depth * sizeof(void*)).
+    //  At the very least we can deal with the temporary alloc from `current` and copy just what we need to a smaller buffer.
+    //
+    // Note:
+    //  Using this struct also lowers the memory footprint of `MemoryInfo` (16 vs 24 bytes)
     //
     struct [[nodiscard]] StackTraceEntryArray
     {
@@ -179,22 +185,37 @@ namespace AllocationTracking
         //
         StackTraceEntryArray& operator=(_In_ const StdStackTraceT& allocStackTrace)
         {
-            const auto len{static_cast<std::size_t>(std::ranges::distance(allocStackTrace))};
-            ElemT* const pNewArr{SelfAllocator<ElemT>{}.allocate(len)};
+            const auto copyLen = [&allocStackTrace]()
+            {
+                // For a stacktrace from frames [0, N), the last two frames of the stack always appear to be:
+                //  N-2> KERNEL32!BaseThreadInitThunk+0x1D
+                //  N-1> ntdll!RtlUserThreadStart+0x28
+                //
+                //  If we have more than 2 frames, exclude these last two frames.
+                //
+                const auto tmpLen{static_cast<std::size_t>(std::ranges::distance(allocStackTrace))};
+                return (tmpLen > 2)
+                    ? tmpLen - 2
+                    : tmpLen;
+            }();
+
+            ElemT* const pNewArr{SelfAllocator<ElemT>{}.allocate(copyLen)};
 
             ElemT* ptr = pNewArr;
-            for (const auto& ste : allocStackTrace)
+            for (auto itr = allocStackTrace.cbegin(), end = std::next(allocStackTrace.cbegin(), copyLen);
+                itr != end;
+                ++itr, ++ptr)
             {
-                std::construct_at(ptr++, ste);
+                std::construct_at(ptr, *itr);
             }
-            if (pNewArr != (ptr - len)) [[unlikely]]
+            if ((pNewArr + copyLen) != ptr) [[unlikely]]
             {
                 __debugbreak();
             }
 
             Reset();
             m_pArr = pNewArr;
-            m_Len = len;
+            m_Len = copyLen;
 
             return *this;
         }
@@ -223,7 +244,7 @@ namespace AllocationTracking
                     }
 
                     Reset();
-                    m_pArr = ptr;
+                    m_pArr = pNewArr;
                     m_Len = len;
                 }
             }
@@ -251,6 +272,10 @@ namespace AllocationTracking
         {
             if (!!m_pArr)
             {
+                for (ElemT* ptr = m_pArr; ptr != (m_pArr + m_Len); ++ptr)
+                {
+                    std::destroy_at(ptr);
+                }
                 AllocT{}.deallocate(m_pArr, m_Len);
                 m_pArr = nullptr;
                 m_Len = 0;
@@ -298,12 +323,6 @@ namespace AllocationTracking
         Free = 0x4
     };
 
-    struct [[nodiscard]] ReallocInfo
-    {
-        void* m_pOriginalMem{nullptr};
-        std::size_t m_OriginalBytes{0};
-    };
-
     struct [[nodiscard]] MemoryInfo
     {
         inline static std::atomic<uint64_t> s_IdCounter{0};
@@ -312,14 +331,51 @@ namespace AllocationTracking
         using TimePoint = decltype(Clock::now());
 
         std::uint64_t m_Id{s_IdCounter++};
-        std::thread::id m_OriginThread{std::this_thread::get_id()};
-        void* m_pMem{nullptr};
-        std::size_t m_ByteCount{0};
         TimePoint m_Timestamp{Clock::now()};
-        StackTraceT m_StackTrace;
-        ReallocInfo m_ReallocInfo; // Only valid if OpFlag::Realloc is set.
+        void* m_pMem{nullptr};
+        std::size_t m_Bytes{0};
+        StackTraceT m_StackTrace{};
         OpFlag m_OpFlagMask{OpFlag::None};
     };
+
+    struct [[nodiscard]] ReallocMemoryInfo
+    {
+        void* m_pOriginalMem{nullptr};
+        std::size_t m_OriginalBytes{0};
+
+        void* m_pMem{nullptr};
+        std::size_t m_Bytes{0};
+
+        //
+        // For the Realloc case, we'll generate a synthetic "Free" MemoryInfo
+        // for the original address and bytes, as well as the new "Alloc" for
+        // the (maybe) new address and bytes.
+        //
+        // This simplifies Tracker impl for Realloc cases, as well as trims
+        // down MemoryInfo size for the more common Alloc and Free cases.
+        //
+        std::pair<MemoryInfo, MemoryInfo> Synthesize() const noexcept
+        {
+            const auto timestamp{MemoryInfo::Clock::now()};
+            return
+            {
+                MemoryInfo{
+                    .m_Id = MemoryInfo::s_IdCounter++,
+                    .m_Timestamp = timestamp,
+                    .m_pMem = m_pOriginalMem,
+                    .m_Bytes = m_OriginalBytes,
+                    .m_OpFlagMask = OpFlag::Free},
+                MemoryInfo{
+                    .m_Id = MemoryInfo::s_IdCounter++,
+                    .m_Timestamp = timestamp,
+                    .m_pMem = m_pMem,
+                    .m_Bytes = m_Bytes,
+                    .m_OpFlagMask = OpFlag::Alloc}
+            };
+        }
+    };
+
+
 
     template <typename KeyT>
     concept ValidMemoryInfoKey =
@@ -373,14 +429,15 @@ namespace AllocationTracking
     {
         std::uint64_t m_Id{MemoryInfo::s_IdCounter++};
         void* m_pMem{nullptr};
-        std::size_t m_ByteCount{0};
+        std::size_t m_Bytes{0};
 
         [[nodiscard]] MemoryInfo ConvertToMemoryInfo() const noexcept
         {
             return MemoryInfo{
                 .m_Id = m_Id,
                 .m_pMem = m_pMem,
-                .m_ByteCount = m_ByteCount};
+                .m_Bytes = m_Bytes,
+                .m_OpFlagMask = OpFlag::Free};
         }
     };
 
@@ -540,7 +597,7 @@ namespace AllocationTracking
             m_bOwned.clear(std::memory_order::release);
         }
 
-        auto AcquireScoped() noexcept
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -585,7 +642,7 @@ namespace AllocationTracking
             }
         }
 
-        auto AcquireScoped() noexcept
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -659,7 +716,7 @@ namespace AllocationTracking
         }
 
         __declspec(noinline)
-        auto AcquireScoped()
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -684,7 +741,7 @@ namespace AllocationTracking
             m_Mutex.unlock();
         }
 
-        auto AcquireScoped()
+        [[nodiscard]] auto AcquireScoped()
         {
             return ScopedLock{this};
         }
@@ -702,11 +759,6 @@ namespace AllocationTracking
 namespace AllocationTracking
 {
     using MemoryInfoQueue = std::list<MemoryInfo, SelfAllocator<MemoryInfo>>;
-    inline void TransferMemoryInfoQueue(_Inout_ MemoryInfoQueue& recipient, _Inout_ MemoryInfoQueue& donor)
-    {
-        static_assert(std::same_as<MemoryInfoQueue, std::list<MemoryInfo, SelfAllocator<MemoryInfo>>>);
-        recipient.splice(recipient.end(), std::move(donor));
-    }
 
     struct ThreadTracker
     {
@@ -732,6 +784,25 @@ namespace AllocationTracking
 
 namespace AllocationTracking
 {
+    using StringT = std::basic_string<char, std::char_traits<char>, SelfAllocator<char>>;
+    using ExternalUserStackTraceEntryMarkers = std::vector<StringT, SelfAllocator<StringT>>;
+
+    // Information needed for logging allocation tracking summaries.
+    struct LogInformationPackage
+    {
+        std::int64_t m_InternalAllocCount{0};
+        std::int64_t m_InternalAllocBytes{0};
+
+        std::int64_t m_ExternalAllocCount{0};
+        std::int64_t m_ExternalAllocBytes{0};
+
+        std::size_t m_BacklogCount{0};
+
+        MemoryInfoSet m_MemoryInfoSet;
+        ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
+        StringT m_TargetModuleNamePrefix;
+    };
+
     class GlobalTracker
     {
     private:
@@ -763,9 +834,6 @@ namespace AllocationTracking
 
             std::atomic<bool> m_bContinueWork{true};
 
-            // Used for when a LogAllocation request comes in and wishes to wait for current worker loop to complete.
-            PreferredLock m_WorkerThreadInProgressLock;
-
             // Note: It's important that this is last
             std::jthread m_Thread;
 
@@ -793,69 +861,46 @@ namespace AllocationTracking
 
     private:
 
-        using StringT = std::basic_string<char, std::char_traits<char>, SelfAllocator<char>>;
-
-        using StackTraceEntryToMemoryInfoSetMap = std::unordered_map<std::stacktrace_entry, MemoryInfoSet, std::hash<std::stacktrace_entry>, std::equal_to<std::stacktrace_entry>, SelfAllocator<std::pair<const std::stacktrace_entry, MemoryInfoSet>>>;
-        StackTraceEntryToMemoryInfoSetMap m_StackTraceEntryToMemoryInfoSetMap;
-
-        using CachedInfo = std::pair<std::stacktrace_entry, MemoryInfoSet::const_iterator>;
-        using AllocationAddrToCachedInfoMap = std::map<void*, CachedInfo, std::less<>, SelfAllocator<std::pair<void* const, CachedInfo>>>;
-        AllocationAddrToCachedInfoMap m_AllocationAddrToCachedInfoMap;
-
-        using AllocationAddrToMemoryInfoMap = std::map<const void*, MemoryInfo, std::less<>, SelfAllocator<std::pair<const void* const, MemoryInfo>>>;
         MemoryInfoSet m_MemoryInfoSet;
 
-        using ExternalUserStackTraceEntryMarkers = std::vector<StringT, SelfAllocator<StringT>>;
         ExternalUserStackTraceEntryMarkers m_ExternalUserStackTraceEntryMarkers;
-
         StringT m_TargetModuleNamePrefix;
 
         std::atomic<bool> m_bCollectFullStackTraces{true};
 
-        struct AllocSummaryInfo
+        template <bool bLimited>
+        [[nodiscard]] LogInformationPackage CreateLogInformationPackage() const
         {
-            std::size_t m_TotalBytes{0};
-            std::size_t m_TotalAllocations{0};
-
-            MemoryInfo::TimePoint m_OldestAllocation{(MemoryInfo::TimePoint::max)()};
-            MemoryInfo::TimePoint m_NewestAllocation{(MemoryInfo::TimePoint::min)()};
-
-            struct FullStackTracePtrLess
+            LogInformationPackage pkg
             {
-                [[nodiscard]] constexpr bool operator()(
-                    _In_ const StackTraceT* pLhs,
-                    _In_ const StackTraceT* pRhs) const noexcept
-                {
-                    return *pLhs < *pRhs;
-                }
+                .m_InternalAllocCount = g_InternalAllocations,
+                .m_InternalAllocBytes = g_InternalAllocationBytes,
+
+                .m_ExternalAllocCount = g_ExternalAllocations,
+                .m_ExternalAllocBytes = g_ExternalAllocationBytes,
+
+                .m_BacklogCount = g_BacklogCount
             };
 
-            using FullStackTracePtrSet = std::set<const StackTraceT*, FullStackTracePtrLess, NonTrackingAllocator<const StackTraceT*>>;
-            FullStackTracePtrSet m_FullStackTraces;
+            if constexpr (!bLimited)
+            {
+                // We'll need to grab lock to copy required structures.
+                const auto scopedTrackerLock{m_TrackerLock.AcquireScoped()};
+                pkg.m_MemoryInfoSet = m_MemoryInfoSet;
+                pkg.m_ExternalUserStackTraceEntryMarkers = m_ExternalUserStackTraceEntryMarkers;
+                pkg.m_TargetModuleNamePrefix = m_TargetModuleNamePrefix;
+            }
 
-            AllocSummaryInfo() noexcept;
-            AllocSummaryInfo(_In_ const MemoryInfo& info) noexcept;
-
-            AllocSummaryInfo& operator<<(_In_ const AllocSummaryInfo& other) noexcept;
-        };
-
-        // Logs each unique alloc-stacktrace, with total bytes each trace has allocated.
-        // Also logs total allocations, total bytes overall, and tracking overhead bytes.
-        void LogSummaryUnsafe(
-            _In_ const LogCallback& logFn,
-            _In_ const LogSummaryType type) const;
+            return pkg;
+        }
 
         void AddExternalStackEntryMarkerUnsafe(_In_ const std::string_view markerSV);
 
-        [[nodiscard]] StackTraceEntryToMemoryInfoSetMap::iterator FindSTEHashMapElement(_In_ const MemoryInfo& info);
-
-        [[nodiscard]] bool IsExternalStackTraceEntryByDescriptionUnsafe(_In_ const std::stacktrace_entry entry) const;
-
-        [[nodiscard]] std::stacktrace_entry FindFirstNonExternalStackTraceEntryByDescriptionUnsafe(_In_ const MemoryInfo& info) const;
-
         void ProcessAllocationUnsafe(_Inout_ MemoryInfo&& info);
 
-        void ProcessDeallocationUnsafe(_In_ const MemoryInfo& info);
+        void ProcessDeallocationUnsafe(
+            _In_ const MemoryInfo& info,
+            _In_ const bool bActualDealloc = true);
 
         static std::shared_ptr<GlobalTracker> s_pTracker;
 
@@ -867,7 +912,6 @@ namespace AllocationTracking
 
         [[nodiscard]] static std::shared_ptr<GlobalTracker> Instance() noexcept;
 
-        __declspec(noinline)
         [[nodiscard]] static std::shared_ptr<GlobalTracker> InstanceIfTrackingEnabled() noexcept;
 
         void SetTargetModuleNamePrefix(_In_ const std::string_view prefixSV);
@@ -889,7 +933,6 @@ namespace AllocationTracking
 
         void LogSummary(
             _In_ const LogCallback& logFn,
-            _In_ const LogSummaryType type,
-            _In_ const bool waitForWorkerThreadLull) const;
+            _In_ const LogSummaryType type) const;
     };
 }

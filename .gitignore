@@ -3,6 +3,10 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
+# AllocationTracking Text Files (Tests, etc)
+Testing/*.txt
+Allocationtracking/*.txt
+
 # User-specific files
 *.rsuser
 *.suo

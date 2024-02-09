@@ -8,6 +8,77 @@
 #include <stacktrace>
 
 
+class [[nodiscard]] ScopedLibraryHandle
+{
+private:
+
+    HMODULE m_hLib{nullptr};
+
+public:
+
+    constexpr ScopedLibraryHandle(_In_opt_ HMODULE hLib = nullptr) noexcept :
+        m_hLib{hLib}
+    { }
+
+    ScopedLibraryHandle(_In_ const ScopedLibraryHandle&) = delete;
+    ScopedLibraryHandle(_Inout_ ScopedLibraryHandle&& other) noexcept :
+        m_hLib{other.m_hLib}
+    {
+        other.m_hLib = nullptr;
+    }
+
+    ~ScopedLibraryHandle()
+    {
+        Reset();
+    }
+
+    ScopedLibraryHandle& operator=(_In_ const ScopedLibraryHandle&) = delete;
+    ScopedLibraryHandle& operator=(_Inout_ ScopedLibraryHandle&& other) noexcept
+    {
+        if (this != &other)
+        {
+            Reset();
+
+            m_hLib = other.m_hLib;
+            other.m_hLib = nullptr;
+        }
+
+        return *this;
+    }
+
+    [[nodiscard]] constexpr bool IsValid() const noexcept
+    {
+        return !!m_hLib;
+    }
+
+    [[nodiscard]] constexpr operator bool() const noexcept
+    {
+        return IsValid();
+    }
+
+    [[nodiscard]] constexpr HMODULE Get() const noexcept
+    {
+        return m_hLib;
+    }
+
+    [[nodiscard]] constexpr operator HMODULE() const noexcept
+    {
+        return Get();
+    }
+
+    void Reset()
+    {
+        if (IsValid())
+        {
+            FreeLibrary(m_hLib);
+            m_hLib = nullptr;
+        }
+    }
+};
+
+ScopedLibraryHandle g_hAllocationTrackerLib;
+
+
 std::filesystem::path BuildLoggerPath(_In_opt_z_ const char* pFilePath)
 {
     const auto p{std::filesystem::path{pFilePath ? pFilePath : R"(C:\users\tferg\desktop\)"} / "ScratchPad_AllocationTrackingLog.txt"};
@@ -39,7 +110,7 @@ void GenerateLoggers()
     }
 
     using namespace std::literals::string_view_literals;
-    static constexpr auto s_cFileLoggerPath{LR"(C:\users\tferg\desktop\AllocationTrackingLog.txt)"sv};
+    static constexpr auto s_cFileLoggerPath{LR"(.\AllocationTrackingLog.txt)"sv};
     std::filesystem::remove(s_cFileLoggerPath);
 
     g_pDispatchLogger = SLL::Factory<SLL::DispatchLogger>{}(
@@ -47,7 +118,7 @@ void GenerateLoggers()
         SLL::Factory<SLL::FileLogger>{}(s_cFileLoggerPath));
 }
 
-static constexpr std::size_t s_cTestBuffersArrayLength{128};
+static constexpr std::size_t s_cTestBuffersArrayLength{32};
 using TestBuffers = std::vector<std::vector<std::uint8_t>>;
 using TestBuffersArray = std::array<TestBuffers, s_cTestBuffersArrayLength>;
 std::unique_ptr<TestBuffersArray> g_pTestBuffers;
@@ -98,6 +169,7 @@ void AllocateForTestBuffer(_In_ const std::size_t idx)
     /**/
 }
 
+template <AllocationTracking::LogSummaryType LogType>
 void LogAllocs()
 {
     if (!g_pDispatchLogger.Get())
@@ -110,16 +182,19 @@ void LogAllocs()
         g_pDispatchLogger->Log("{}", logMsgSV);
     };
 
-    AllocationTracking::LogAllocations(LogCallback, AllocationTracking::LogSummaryType::Normal, true);
+    const auto pfLogAllocaitons = reinterpret_cast<AllocationTracking::LogAllocationsFn>(
+        GetProcAddress(g_hAllocationTrackerLib, "AllocationTracker_LogAllocations"));
+    if (!!pfLogAllocaitons)
+    {
+        pfLogAllocaitons(LogCallback, LogType);
+    }
 }
 
 
 void RunTrackerTests()
 {
-    // LogAllocs();
     {
         g_pTestBuffers = std::make_unique<TestBuffersArray>();
-        // LogAllocs();
 
         {
             const auto allocT0{std::chrono::steady_clock::now()};
@@ -129,8 +204,6 @@ void RunTrackerTests()
             g_pStdOutLogger->Log("Test Buffer Alloc Duration[{}]", std::chrono::duration_cast<std::chrono::milliseconds>(dur));
         }
 
-        // LogAllocs();
-
         {
             const auto freeT0{std::chrono::steady_clock::now()};
             g_pTestBuffers.reset();
@@ -138,45 +211,82 @@ void RunTrackerTests()
             g_pStdOutLogger->Log("Test Buffer Free Duration[{}]", std::chrono::duration_cast<std::chrono::milliseconds>(freeT1 - freeT0));
         }
     }
-    // LogAllocs();
+
     {
         static constexpr std::size_t s_cElems = (1 << 30);
         auto ptr = std::make_unique<std::uint32_t[]>(s_cElems);
-        if (!!ptr) { std::fill(&ptr[0], &ptr[s_cElems], 0); }
-        // LogAllocs();
+        if (!!ptr) { std::fill(&ptr[0], &ptr[s_cElems], 0); } // Touch the memory so it gets committed.
     }
 
-    for (auto i = 0u; i < 2u; ++i)
+    for (auto i = 0u; i < 10u; ++i)
     {
-        // LogAllocs();
-        // std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    // LogAllocs();
+    LogAllocs<AllocationTracking::LogSummaryType::Normal>();
 }
 
-static void EnableTracking(_In_ const bool bEnable)
+
+static ScopedLibraryHandle EnableTracking()
 {
-    if (!bEnable)
+    using namespace std::string_view_literals;
+    ScopedLibraryHandle hAllocationTracker{LoadLibraryA(".\\AllocationTracker.dll")};
+    if (!hAllocationTracker)
     {
-        AllocationTracking::EnableTracking(true);
-        return;
+        SLL::StdErrLogger{}.Log("Failed to load AllocationTracker DLL - WinErr[{}]", GetLastError());
+        return {};
     }
 
-    AllocationTracking::SetTargetModuleNamePrefix("Testing!");
-    AllocationTracking::RegisterExternalStackEntryMarker("!SLL::Factory");
-    AllocationTracking::RegisterExternalStackEntryMarker("!GenerateLogger");
-    AllocationTracking::SetCollectFullStackTraces(true);
-    AllocationTracking::EnableTracking(true);
+    const auto pfSetTargetModuleNamePrefix = reinterpret_cast<AllocationTracking::SetTargetModuleNamePrefix>(
+        GetProcAddress(hAllocationTracker, "AllocationTracker_SetTargetModuleNamePrefix"));
+    if (!pfSetTargetModuleNamePrefix)
+    {
+        SLL::StdErrLogger{}.Log("Failed to find AllocationTracker_SetTargetModuleNamePrefix function - WinErr[{}]", GetLastError());
+        return {};
+    }
+    pfSetTargetModuleNamePrefix("Testing!");
+
+    const auto pfRegisterExternalStackEntryMarkers = reinterpret_cast<AllocationTracking::RegisterExternalStackEntryMarkers>(
+        GetProcAddress(hAllocationTracker, "AllocationTracker_RegisterExternalStackEntryMarkers"));
+    if (!pfRegisterExternalStackEntryMarkers)
+    {
+        SLL::StdErrLogger{}.Log("Failed to find AllocationTracker_RegisterExternalStackEntryMarkers function - WinErr[{}]", GetLastError());
+        return {};
+    }
+    pfRegisterExternalStackEntryMarkers({"!SLL::Factory"sv, "!GenerateLogger"sv});
+
+    const auto pfSetCollectFullStackTraces = reinterpret_cast<AllocationTracking::SetCollectFullStackTraces>(
+        GetProcAddress(hAllocationTracker, "AllocationTracker_SetCollectFullStackTraces"));
+    if (!pfSetCollectFullStackTraces)
+    {
+        SLL::StdErrLogger{}.Log("Failed to find AllocationTracker_SetCollectFullStackTraces function - WinErr[{}]", GetLastError());
+        return {};
+    }
+    pfSetCollectFullStackTraces(true);
+
+    const auto pfEnableTracking = reinterpret_cast<AllocationTracking::EnableTracking>(
+        GetProcAddress(hAllocationTracker, "AllocationTracker_EnableTracking"));
+    if (!pfSetCollectFullStackTraces)
+    {
+        SLL::StdErrLogger{}.Log("Failed to find AllocationTracker_EnableTracking function - WinErr[{}]", GetLastError());
+        return {};
+    }
+    pfEnableTracking(true);
+
+    return hAllocationTracker;
 }
 
-static volatile bool g_bReadyForExit{false};
+static volatile bool g_bReadyForExit{true};
 
 int main(
     [[maybe_unused]] _In_ const int argc,
     [[maybe_unused]] _In_count_(argc) const char* argv[])
 {
-    EnableTracking(true);
+    g_hAllocationTrackerLib = EnableTracking();
+    if (!g_hAllocationTrackerLib)
+    {
+        return EXIT_FAILURE;
+    }
 
     GenerateLoggers();
     g_pStdOutLogger->Log("Testing AllocationTracking");
@@ -186,7 +296,7 @@ int main(
         RunTrackerTests();
     } while (!g_bReadyForExit);
 
-    g_bReadyForExit = false;
+    g_bReadyForExit = true;
     do
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
